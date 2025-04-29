@@ -63,7 +63,7 @@ pub fn apply_grow(comptime T: type, comptime Op: SimdOp, c: *veks(T), a: veks(T)
     c.start = @min(a.start, b.start);
     c.stop = @max(a.stop, b.stop);
 
-    // https://ziglang.org/documentation/0.14.0/#select <-- use this guy to snag da crooked bytes
+    //TODO https://ziglang.org/documentation/0.14.0/#select <-- use this guy to snag da crooked bytes
 
     const vek_start = c.start / lanes(T);
     const vek_end = (c.stop - 1) / lanes(T) + 1;
