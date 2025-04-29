@@ -12,14 +12,8 @@ const assert = std.debug.assert;
 
 const TARGET_SIMD_SIZE: usize = 64; // AVX512
 
-fn print_f64s(s: []const f64) void {
-    for (s) |x| {
-        std.debug.print("{d:.2} ", .{x});
-    }
-    std.debug.print("\n", .{});
-}
-fn print_f32s(s: []const f32) void {
-    for (s) |x| {
+fn print_vek(comptime T: type, v: veks(T)) void {
+    for (v.veks) |x| {
         std.debug.print("{d:.2} ", .{x});
     }
     std.debug.print("\n", .{});
@@ -46,155 +40,82 @@ pub const SimdOp = enum {
 //TODO add 64 bit aligned metric buffer allocation funcs
 // make all simd funcs operate over aligned ptrCasts
 
-pub fn apply(comptime T: type, comptime Op: SimdOp, c: []T, a: []const T, b: []const T) void {
-    assert(a.len == b.len and b.len == c.len);
-    const lanes = TARGET_SIMD_SIZE / @sizeOf(T);
-    const vec_t = @Vector(lanes, T);
-    const leftovers = a.len % lanes;
-    const stop = a.len - leftovers;
-    var i: usize = 0;
+fn lanes(comptime T: type) usize {
+    return TARGET_SIMD_SIZE / @sizeOf(T);
+}
 
-    while (i < stop) : (i += lanes) {
-        const a_vec: vec_t = @ptrCast(a[i..][0..lanes].ptr); // does not work rn
-        const b_vec: vec_t = @ptrCast(b[i..][0..lanes].ptr);
-        c[i..][0..lanes].* = switch (Op) {
-            .Add => a_vec + b_vec,
-            .Sub => a_vec - b_vec,
-            .Div => a_vec / b_vec,
-            .Mul => a_vec * b_vec,
-            .Mod => a_vec % b_vec,
-            .Min => @min(a_vec, b_vec),
-            .Max => @max(a_vec, b_vec),
-            .Log => @log2(b_vec) / @log2(a_vec),
-            .Pow => @exp2(b_vec * @log2(a_vec)),
-            .LShift => a_vec << b_vec,
-            .RShift => a_vec >> b_vec,
-            .SLShift => a_vec <<| b_vec,
-            .And => a_vec & b_vec,
-            .Or => a_vec | b_vec,
-            .Xor => a_vec ^ b_vec,
-        };
-    }
-    // leftovers
-    while (i < a.len) : (i += 1) {
-        c[i] = switch (Op) {
-            .Add => a[i] + b[i],
-            .Sub => a[i] - b[i],
-            .Div => a[i] / b[i],
-            .Mul => a[i] * b[i],
-            .Mod => a[i] % b[i],
-            .Min => @min(a[i], b[i]),
-            .Max => @max(a[i], b[i]),
-            .Log => @log2(b[i]) / @log2(a[i]),
-            .Pow => @exp2(b[i] * @log2(a[i])),
-            .LShift => a[i] << b[i],
-            .RShift => a[i] >> b[i],
-            .SLShift => a[i] <<| b[i],
-            .And => a[i] & b[i],
-            .Or => a[i] | b[i],
-            .Xor => a[i] ^ b[i],
+fn vek_t(comptime T: type) type {
+    return @Vector(lanes(T), T);
+}
+fn veks(comptime T: type) type {
+    return struct {
+        veks: []vek_t(T),
+        start: usize = 0,
+        stop: usize = 0,
+    };
+}
+
+/// apply but will effectively be a memcpy for non overlaping indexes
+pub fn apply_grow(comptime T: type, comptime Op: SimdOp, c: *veks(T), a: veks(T), b: veks(T)) void {
+    assert(a.stop > a.start);
+    assert(b.stop > b.start);
+    assert(a.veks.len == b.veks.len and b.veks.len == c.veks.len);
+    c.start = @min(a.start, b.start);
+    c.stop = @max(a.stop, b.stop);
+
+    // https://ziglang.org/documentation/0.14.0/#select <-- use this guy to snag da crooked bytes
+
+    const vek_start = c.start / lanes(T);
+    const vek_end = (c.stop - 1) / lanes(T) + 1;
+
+    for (vek_start..vek_end) |i| {
+        c.veks[i] = switch (Op) {
+            .Add => a.veks[i] + b.veks[i],
+            .Sub => a.veks[i] - b.veks[i],
+            .Div => a.veks[i] / b.veks[i],
+            .Mul => a.veks[i] * b.veks[i],
+            .Mod => a.veks[i] % b.veks[i],
+            .Min => @min(a.veks[i], b.veks[i]),
+            .Max => @max(a.veks[i], b.veks[i]),
+            .Log => @log2(b.veks[i]) / @log2(a.veks[i]),
+            .Pow => @exp2(b.veks[i] * @log2(a.veks[i])),
+            .LShift => a.veks[i] << b.veks[i],
+            .RShift => a.veks[i] >> b.veks[i],
+            .SLShift => a.veks[i] <<| b.veks[i],
+            .And => a.veks[i] & b.veks[i],
+            .Or => a.veks[i] | b.veks[i],
+            .Xor => a.veks[i] ^ b.veks[i],
         };
     }
 }
 
-pub fn apply_num(comptime T: type, comptime Op: SimdOp, c: []T, a: []const T, b: T) void {
-    assert(a.len == c.len);
-    const lanes = TARGET_SIMD_SIZE / @sizeOf(T);
-    const vec_t = @Vector(lanes, T);
-    const leftovers = a.len % lanes;
-    const stop = a.len - leftovers;
-    var i: usize = 0;
+pub fn apply_strict(comptime T: type, comptime Op: SimdOp, c: *veks(T), a: veks(T), b: veks(T)) void {
+    assert(a.stop > a.start);
+    assert(b.stop > b.start);
+    assert(a.veks.len == b.veks.len and b.veks.len == c.veks.len);
+    c.start = @max(a.start, b.start);
+    c.stop = @min(a.stop, b.stop);
 
-    const b_vec: vec_t = @splat(b);
-    while (i < stop) : (i += lanes) {
-        const a_vec: vec_t = a[i..][0..lanes].*;
-        c[i..][0..lanes].* = switch (Op) {
-            .Add => a_vec + b_vec,
-            .Sub => a_vec - b_vec,
-            .Div => a_vec / b_vec,
-            .Mul => a_vec * b_vec,
-            .Mod => a_vec % b_vec,
-            .Min => @min(a_vec, b_vec),
-            .Max => @max(a_vec, b_vec),
-            .Log => @log2(b_vec) / @log2(a_vec),
-            .Pow => @exp2(b_vec * @log2(a_vec)),
-            .LShift => a_vec << b_vec,
-            .SLShift => a_vec <<| b_vec,
-            .RShift => a_vec >> b_vec,
-            .And => a_vec & b_vec,
-            .Or => a_vec | b_vec,
-            .Xor => a_vec ^ b_vec,
-        };
-    }
-    // leftovers
-    while (i < a.len) : (i += 1) {
-        c[i] = switch (Op) {
-            .Add => a[i] + b,
-            .Sub => a[i] - b,
-            .Div => a[i] / b,
-            .Mul => a[i] * b,
-            .Mod => a[i] % b,
-            .Min => @min(a[i], b),
-            .Max => @max(a[i], b),
-            .Log => @log2(b) / @log2(a[i]),
-            .Pow => @exp2(b * @log2(a[i])),
-            .LShift => a[i] << b,
-            .SLShift => a[i] <<| b,
-            .RShift => a[i] >> b,
-            .And => a[i] & b,
-            .Or => a[i] | b,
-            .Xor => a[i] ^ b,
-        };
-    }
-}
+    const vek_start = c.start / lanes(T);
+    const vek_end = (c.stop - 1) / lanes(T) + 1;
 
-fn num_apply(comptime T: type, comptime Op: SimdOp, c: []T, a: T, b: []const T) void {
-    assert(b.len == c.len);
-    const lanes = TARGET_SIMD_SIZE / @sizeOf(T);
-    const vec_t = @Vector(lanes, T);
-    const leftovers = b.len % lanes;
-    const stop = b.len - leftovers;
-    var i: usize = 0;
-
-    const a_vec: vec_t = @splat(a);
-    while (i < stop) : (i += lanes) {
-        const b_vec: vec_t = b[i..][0..lanes].*;
-        c[i..][0..lanes].* = switch (Op) {
-            .Add => a_vec + b_vec,
-            .Sub => a_vec - b_vec,
-            .Div => a_vec / b_vec,
-            .Mul => a_vec * b_vec,
-            .Mod => a_vec % b_vec,
-            .Min => @min(a_vec, b_vec),
-            .Max => @max(a_vec, b_vec),
-            .Log => @log2(b_vec) / @log2(a_vec),
-            .Pow => @exp2(b_vec * @log2(a_vec)),
-            .LShift => a_vec << b_vec,
-            .SLShift => a_vec <<| b_vec,
-            .RShift => a_vec >> b_vec,
-            .And => a_vec & b_vec,
-            .Or => a_vec | b_vec,
-            .Xor => a_vec ^ b_vec,
-        };
-    }
-    // leftovers
-    while (i < a.len) : (i += 1) {
-        c[i] = switch (Op) {
-            .Add => a + b[i],
-            .Sub => a - b[i],
-            .Div => a / b[i],
-            .Mul => a * b[i],
-            .Mod => a % b[i],
-            .Min => @min(a, b[i]),
-            .Max => @max(a, b[i]),
-            .Log => @log2(b[i]) / @log2(a),
-            .Pow => @exp2(b[i] * @log2(a)),
-            .LShift => a << b[i],
-            .SLShift => a <<| b[i],
-            .RShift => a >> b[i],
-            .And => a & b[i],
-            .Or => a | b[i],
-            .Xor => a ^ b[i],
+    for (vek_start..vek_end) |i| {
+        c.veks[i] = switch (Op) {
+            .Add => a.veks[i] + b.veks[i],
+            .Sub => a.veks[i] - b.veks[i],
+            .Div => a.veks[i] / b.veks[i],
+            .Mul => a.veks[i] * b.veks[i],
+            .Mod => a.veks[i] % b.veks[i],
+            .Min => @min(a.veks[i], b.veks[i]),
+            .Max => @max(a.veks[i], b.veks[i]),
+            .Log => @log2(b.veks[i]) / @log2(a.veks[i]),
+            .Pow => @exp2(b.veks[i] * @log2(a.veks[i])),
+            .LShift => a.veks[i] << b.veks[i],
+            .RShift => a.veks[i] >> b.veks[i],
+            .SLShift => a.veks[i] <<| b.veks[i],
+            .And => a.veks[i] & b.veks[i],
+            .Or => a.veks[i] | b.veks[i],
+            .Xor => a.veks[i] ^ b.veks[i],
         };
     }
 }
@@ -207,72 +128,64 @@ pub const SimdOp1 = enum {
     Not,
 };
 
-pub fn apply1(comptime T: type, comptime Op: SimdOp1, c: []T, a: []const T) void {
-    assert(a.len == c.len);
-    const lanes = TARGET_SIMD_SIZE / @sizeOf(T);
-    const vec_t = @Vector(lanes, T);
-    const leftovers = a.len % lanes;
-    const stop = a.len - leftovers;
-    var i: usize = 0;
-    while (i < stop) : (i += lanes) {
-        const a_vec: vec_t = a[i..][0..lanes].*;
-        c[i..][0..lanes].* = switch (Op) {
-            .Ceil => @ceil(a_vec),
-            .Floor => @floor(a_vec),
-            .Round => @round(a_vec),
-            .Sqrt => @sqrt(a_vec),
-            .Not => ~a_vec,
-        };
-    }
-    // leftovers
-    while (i < a.len) : (i += 1) {
-        c[i] = switch (Op) {
-            .Ceil => @ceil(a[i]),
-            .Floor => @floor(a[i]),
-            .Round => @round(a[i]),
-            .Sqrt => @sqrt(a[i]),
-            .Not => ~a[i],
-        };
-    }
-}
-
 pub const SimdOp3 = enum {
     Fma,
 };
-fn apply3(comptime T: type, comptime Op: SimdOp3, d: []T, a: []const T, b: []const T, c: []const T) void {
-    assert(a.len == b.len and b.len == c.len);
-    const lanes = TARGET_SIMD_SIZE / @sizeOf(T);
-    const vec_t = @Vector(lanes, T);
-    const leftovers = a.len % lanes;
-    const stop = a.len - leftovers;
-    var i: usize = 0;
 
-    while (i < stop) : (i += lanes) {
-        const a_vec: vec_t = a[i..][0..lanes].*;
-        const b_vec: vec_t = b[i..][0..lanes].*;
-        const c_vec: vec_t = c[i..][0..lanes].*;
-        d[i..][0..lanes].* = switch (Op) {
-            .Fma => @mulAdd(vec_t, a_vec, b_vec, c_vec),
-        };
-    }
-    // leftovers
-    while (i < a.len) : (i += 1) {
-        d[i] = switch (Op) {
-            .Add => a[i] + b[i],
-        };
-    }
+test "basic add" {
+    const num_t = f64;
+    var a_arr = [_]vek_t(num_t){ .{ 0, 1, 7, 69, 420, 666, 6969, 50 }, .{ 100, 10, 20, 0, 0, 0, 0, 0 } };
+    const a: veks(num_t) = .{
+        .veks = &a_arr,
+        .stop = 11,
+    };
+    var b_arr = [_]vek_t(num_t){ .{ 0, 1, 3, 96, 580, 444, 9696, 50 }, .{ 100, 10, 20, 0, 0, 0, 0, 0 } };
+    const b: veks(num_t) = .{
+        .veks = &b_arr,
+        .stop = 11,
+    };
+    var c_expect_arr = [_]vek_t(num_t){ .{ 0, 2, 10, 165, 1000, 1110, 16665, 100 }, .{ 200, 20, 40, 0, 0, 0, 0, 0 } };
+    const c_expect: veks(num_t) = .{
+        .veks = &c_expect_arr,
+        .stop = 11,
+    };
+    var c_actual_arr = std.mem.zeroes([2]vek_t(num_t));
+    var c_actual: veks(num_t) = .{
+        .veks = &c_actual_arr,
+    };
+    apply(num_t, .Add, &c_actual, a, b);
+    print_vek(num_t, c_expect);
+    print_vek(num_t, c_actual);
+    try testing.expectEqualSlices(vek_t(num_t), c_expect.veks, c_actual.veks);
+    try testing.expectEqual(c_expect.start, c_actual.start);
+    try testing.expectEqual(c_expect.stop, c_actual.stop);
 }
 
-test "add some shit!!! YUUUH" {
-    const a: []const f64 = &.{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const b: []const f64 = &.{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const c_expect: []const f64 = &.{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
-    var c_mem: [11]f64 = undefined;
-    var known_at_runtime_zero: usize = 0;
-    _ = &known_at_runtime_zero;
-    const c_actual = c_mem[known_at_runtime_zero..];
-    apply(f64, .Add, c_actual, a, b);
-    // print_f64s(c_expect);
-    // print_f64s(c_actual);
-    try testing.expectEqualSlices(f64, c_expect, c_actual);
+test "misaligned add" {
+    const num_t = f64;
+    var a_arr = [_]vek_t(num_t){ .{ 0, 1, 7, 69, 420, 666, 6969, 50 }, .{ 100, 10, 20, 0, 0, 0, 0, 0 } };
+    const a: veks(num_t) = .{
+        .veks = &a_arr,
+        .stop = 11,
+    };
+    var b_arr = [_]vek_t(num_t){ .{ 0, 1, 3, 96, 580, 444, 9696, 50 }, .{ 100, 10, 20, 0, 0, 0, 0, 0 } };
+    const b: veks(num_t) = .{
+        .veks = &b_arr,
+        .stop = 11,
+    };
+    var c_expect_arr = [_]vek_t(num_t){ .{ 0, 2, 10, 165, 1000, 1110, 16665, 100 }, .{ 200, 20, 40, 0, 0, 0, 0, 0 } };
+    const c_expect: veks(num_t) = .{
+        .veks = &c_expect_arr,
+        .stop = 11,
+    };
+    var c_actual_arr = std.mem.zeroes([2]vek_t(num_t));
+    var c_actual: veks(num_t) = .{
+        .veks = &c_actual_arr,
+    };
+    apply(num_t, .Add, &c_actual, a, b);
+    print_vek(num_t, c_expect);
+    print_vek(num_t, c_actual);
+    try testing.expectEqualSlices(vek_t(num_t), c_expect.veks, c_actual.veks);
+    try testing.expectEqual(c_expect.start, c_actual.start);
+    try testing.expectEqual(c_expect.stop, c_actual.stop);
 }
