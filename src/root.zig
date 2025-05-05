@@ -3,7 +3,6 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
-var allocator: Allocator = undefined;
 // pub export fn add(a: i32, b: i32) i32 {
 //     return a + b;
 // }
@@ -13,7 +12,19 @@ var allocator: Allocator = undefined;
 // }
 
 fn print_vek(comptime T: type, v: Stream(T)) void {
-    for (v.ptr) |x| {
+    const iter = stream_iter(T, v);
+    for (iter.start..iter.stop) |i| {
+        std.debug.print("{d:.2} ", .{v.ptr[i]});
+    }
+    std.debug.print("\n", .{});
+}
+
+fn ceildiv(x: usize, y: usize) usize {
+    return x / y + @intFromBool(x % y != 0);
+}
+
+fn print_float_slice(comptime T: type, s: []T) void {
+    for (s) |x| {
         std.debug.print("{d:.2} ", .{x});
     }
     std.debug.print("\n", .{});
@@ -28,7 +39,7 @@ pub fn Vek(comptime T: type) type {
     return @Vector(lanes(T), T);
 }
 pub fn Stream(comptime T: type) type {
-    return struct {
+    return extern struct {
         ptr: [*]Vek(T),
         start: usize = 0,
         stop: usize = 0,
@@ -38,51 +49,89 @@ pub const Range = extern struct {
     start: usize = 0,
     stop: usize = 0,
 };
+pub fn stream_iter(comptime T: type, stream: Stream(T)) Range {
+    return Range{
+        .start = stream.start / lanes(T),
+        .stop = (stream.stop - 1) / lanes(T) + 1,
+    };
+}
 pub fn Streams(comptime T: type) type {
     return extern struct {
         streams_ptr: [*]Vek(T),
         ranges_ptr: [*]Range,
-        stream_len: usize,
-        num_streams: usize,
+        veks_per_stream: usize,
+        len: usize,
+        cap: usize,
     };
 }
 
-pub export fn init(buf_ptr: [*]u8, len: usize) void {
+pub const State = struct {
+    allocator: Allocator,
+};
+pub fn Result(comptime T: type) type {
+    return extern struct {
+        ok: T,
+        err: u16 = 0,
+    };
+}
+
+pub fn errify(comptime T: type, err: anyerror) Result(T) {
+    return Result(T){ .ok = undefined, .err = @intFromError(err) };
+}
+pub fn resultify(comptime T: type, res: anyerror!T) Result(T) {
+    if (res) |val| {
+        return Result(T){ .ok = val };
+    } else |err| {
+        return errify(T, err);
+    }
+}
+
+pub export fn init(buf_ptr: [*]u8, len: usize) Result(*State) {
     const buf = buf_ptr[0..len];
     var fba = std.heap.FixedBufferAllocator.init(buf);
-    allocator = fba.threadSafeAllocator();
-}
-pub fn Make_Result(comptime T: type) type {
-    return extern union {
-        ok: Streams(T),
-        err: u16,
-    };
-}
-pub fn make(comptime T: type, stream_len: usize, num_streams: usize) Make_Result(T) {
-    const streams = allocator.alloc(Vek(T), stream_len * num_streams) catch |err| return Make_Result(T){ .err = @intFromError(err) };
-    const ranges = allocator.alloc(Range, num_streams) catch |err| return Make_Result(T){ .err = @intFromError(err) };
-    return Make_Result(T){
-        .ok = Streams(T){
-            .streams_ptr = streams.ptr,
-            .ranges_ptr = ranges.ptr,
-            .stream_len = stream_len,
-            .num_streams = num_streams,
-        },
-    };
-}
-pub export fn make_f64(stream_len: usize, num_streams: usize) Make_Result(f64) {
-    return make(f64, stream_len, num_streams);
-}
-pub export fn make_f32(stream_len: usize, num_streams: usize) Make_Result(f32) {
-    return make(f32, stream_len, num_streams);
-}
-pub export fn make_i64(stream_len: usize, num_streams: usize) Make_Result(i64) {
-    return make(i64, stream_len, num_streams);
+    const allocator = fba.threadSafeAllocator();
+    const state = allocator.create(State) catch |err| return errify(*State, err);
+    state.allocator = allocator;
+    return Result(*State){ .ok = state };
 }
 
-pub fn get_stream(comptime T: type, streams: Streams(T), i: usize) Stream(T) {
-    assert(i < streams.num_streams);
-    const ptr_start = i * streams.stream_len;
+pub fn make(comptime T: type, allocator: Allocator, stream_size: usize, num_streams: usize) Allocator.Error!Streams(T) {
+    const veks_per_stream = ceildiv(stream_size, lanes(T));
+    const veks_cap = veks_per_stream * num_streams;
+    const streams = try allocator.alloc(Vek(T), veks_cap);
+    const ranges = try allocator.alloc(Range, num_streams);
+    return Streams(T){
+        .streams_ptr = streams.ptr,
+        .ranges_ptr = ranges.ptr,
+        .veks_per_stream = veks_per_stream,
+        .len = 0,
+        .cap = num_streams,
+    };
+}
+pub export fn make_f64(s: *State, stream_len: usize, num_streams: usize) Result(Streams(f64)) {
+    return resultify(Streams(f64), make(f64, s.allocator, stream_len, num_streams));
+}
+pub export fn make_f32(s: *State, stream_len: usize, num_streams: usize) Result(Streams(f32)) {
+    return resultify(Streams(f32), make(f32, s.allocator, stream_len, num_streams));
+}
+pub export fn make_i64(s: *State, stream_len: usize, num_streams: usize) Result(Streams(i64)) {
+    return resultify(Streams(i64), make(i64, s.allocator, stream_len, num_streams));
+}
+
+pub fn slice_to_stream(comptime T: type, streams: *Streams(T), slice: []T, start_idx: usize) Stream(T) {
+    var stream = new_stream(T, streams);
+    set_stream(T, &stream, slice, start_idx);
+    return stream;
+}
+
+pub fn new_stream(comptime T: type, streams: *Streams(T)) Stream(T) {
+    const stream = get_stream(T, streams, streams.len);
+    streams.len += 1;
+    return stream;
+}
+pub fn get_stream(comptime T: type, streams: *Streams(T), i: usize) Stream(T) {
+    assert(i < streams.cap);
+    const ptr_start = i * streams.veks_per_stream;
     const ptr = streams.streams_ptr + ptr_start;
     const range = streams.ranges_ptr[i];
     return Stream(T){
@@ -91,15 +140,21 @@ pub fn get_stream(comptime T: type, streams: Streams(T), i: usize) Stream(T) {
         .stop = range.stop,
     };
 }
+pub fn set_stream(comptime T: type, stream: *Stream(T), slice: []T, start_idx: usize) void {
+    stream.start = start_idx;
+    stream.stop = start_idx + slice.len;
+    const stream_ptr: [*]T = @ptrCast(stream.ptr);
+    @memcpy(stream_ptr + start_idx, slice);
+}
 
 pub const Operand_Variant = enum {
     Vector,
     Number,
 };
-pub fn Operand(comptime Num_T: type, comptime variant: Operand_Variant) type {
+pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
     return switch (variant) {
-        .Vector => Stream(Num_T),
-        .Number => Num_T,
+        .Vector => Stream(T),
+        .Number => T,
     };
 }
 
@@ -125,15 +180,37 @@ pub const Simd_Op = enum {
     Xor,
 };
 
+fn idx_vek(comptime T: type) @Vector(lanes(T), usize) {
+    var arr: [lanes(T)]usize = undefined;
+    for (0..lanes(T)) |i| {
+        arr[i] = i;
+    }
+    const vek: @Vector(lanes(T), usize) = arr;
+    return vek;
+}
+
+fn nans_vek(comptime T: type, s: Stream(T), vek_i: usize) Vek(bool) {
+    const index_vec = comptime idx_vek(T);
+    const i = vek_i * lanes(T);
+    const stop = @max(@min(s.stop - i, lanes(T)), 0);
+    const start_idx = @max(@min(i - s.start, lanes(T)), 0);
+    return (index_vec >= stop) | (index_vec < start_idx);
+}
+
+fn to_slice(comptime T: type, s: Stream(T)) []T {
+    var slice: [*]T = @ptrCast(s.ptr);
+    return slice[s.start..s.stop];
+}
+
 pub fn apply(
-    comptime Num_T: type,
+    comptime T: type,
     comptime op: Simd_Op,
     comptime mode: Apply_Mode,
-    c: *Stream(Num_T),
+    c: *Stream(T),
     comptime a_t: Operand_Variant,
-    a: Operand(Num_T, a_t),
+    a: Operand(T, a_t),
     comptime b_t: Operand_Variant,
-    b: Operand(Num_T, b_t),
+    b: Operand(T, b_t),
 ) void {
     if (a_t == .Vector and b_t == .Vector) {
         assert(a.stop > a.start);
@@ -157,17 +234,16 @@ pub fn apply(
     } else {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    const ninf: Vek(Num_T) = @splat(-std.math.inf(Num_T));
 
-    const vek_start = c.start / lanes(Num_T);
-    const vek_end = (c.stop - 1) / lanes(Num_T) + 1;
+    const vek_start = c.start / lanes(T);
+    const vek_end = (c.stop - 1) / lanes(T) + 1;
 
     for (vek_start..vek_end) |i| {
-        const a_vek: Vek(Num_T) = switch (a_t) {
+        const a_vek: Vek(T) = switch (a_t) {
             .Vector => a.ptr[i],
             .Number => @splat(a),
         };
-        const b_vek: Vek(Num_T) = switch (b_t) {
+        const b_vek: Vek(T) = switch (b_t) {
             .Vector => b.ptr[i],
             .Number => @splat(b),
         };
@@ -189,262 +265,13 @@ pub fn apply(
             .Xor => a_vek ^ b_vek,
         };
         if (mode == .Grow) {
-            const a_nans = a_vek == ninf;
-            c.ptr[i] = @select(Num_T, a_nans, b_vek, c.ptr[i]);
-            const b_nans = b_vek == ninf;
-            c.ptr[i] = @select(Num_T, b_nans, a_vek, c.ptr[i]);
+            const a_nans = nans_vek(T, a, i);
+            c.ptr[i] = @select(T, a_nans, b_vek, c.ptr[i]);
+            const b_nans = nans_vek(T, b, i);
+            c.ptr[i] = @select(T, b_nans, a_vek, c.ptr[i]);
         }
     }
 }
-
-pub export fn add(s: Streams(f64), c_idx: usize, a_idx: usize, b_idx: usize) void {
-    const a = get_stream(f64, s, a_idx);
-    const b = get_stream(f64, s, b_idx);
-    var c = get_stream(f64, s, c_idx);
-    apply(f64, .Add, .Strict, &c, .Vector, a, .Vector, b);
-}
-// pub export fn sub(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor(c: veks(f64), a: veks(f64), b: veks(f64)) void {
-//     apply(f64, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
-
-// pub export fn add_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Add, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn sub_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor_f32(c: veks(f32), a: veks(f32), b: veks(f32)) void {
-//     apply(f32, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
-
-// pub export fn add_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Add, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn sub_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn lshift_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .LShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn rshift_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .RShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn slshift_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .SLShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn and_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .And, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn or_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Or, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor_i64(c: veks(i64), a: veks(i64), b: veks(i64)) void {
-//     apply(i64, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
-
-// pub export fn add_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Add, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn sub_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn lshift_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .LShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn rshift_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .RShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn slshift_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .SLShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn and_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .And, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn or_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Or, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor_i32(c: veks(i32), a: veks(i32), b: veks(i32)) void {
-//     apply(i32, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
-
-// pub export fn add_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Add, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn sub_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn lshift_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .LShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn rshift_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .RShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn slshift_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .SLShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn and_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .And, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn or_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Or, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor_u64(c: veks(u64), a: veks(u64), b: veks(u64)) void {
-//     apply(u64, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
-
-// pub export fn add_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Add, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn sub_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Sub, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mul_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Mul, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn div_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Div, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn pow_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Pow, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn log_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Log, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn mod_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Mod, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn min_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Min, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn max_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Max, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn lshift_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .LShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn rshift_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .RShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn slshift_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .SLShift, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn and_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .And, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn or_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Or, .Strict, c, .Vector, a, .Vector, b);
-// }
-// pub export fn xor_u32(c: veks(u32), a: veks(u32), b: veks(u32)) void {
-//     apply(u32, .Xor, .Strict, c, .Vector, a, .Vector, b);
-// }
 
 pub const BoolOp = enum {
     Gt,
@@ -456,14 +283,14 @@ pub const BoolOp = enum {
 };
 
 fn apply_bool(
-    comptime num_t: type,
+    comptime T: type,
     comptime Op: BoolOp,
     comptime mode: Apply_Mode,
     c: *Stream(bool),
     comptime a_t: Operand_Variant,
-    a: Operand(num_t, a_t),
+    a: Operand(T, a_t),
     comptime b_t: Operand_Variant,
-    b: Operand(num_t, b_t),
+    b: Operand(T, b_t),
 ) void {
     if (a_t == .Vector and b_t == .Vector) {
         assert(a.stop > a.start);
@@ -487,17 +314,16 @@ fn apply_bool(
     } else {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    const ninf: Vek(num_t) = @splat(-std.math.inf(num_t));
 
-    const vek_start = c.start / lanes(num_t);
-    const vek_end = (c.stop - 1) / lanes(num_t) + 1;
+    const vek_start = c.start / lanes(T);
+    const vek_end = (c.stop - 1) / lanes(T) + 1;
 
     for (vek_start..vek_end) |i| {
-        const a_vek: Vek(num_t) = switch (a_t) {
+        const a_vek: Vek(T) = switch (a_t) {
             .Vector => a.ptr[i],
             .Number => @splat(a),
         };
-        const b_vek: Vek(num_t) = switch (b_t) {
+        const b_vek: Vek(T) = switch (b_t) {
             .Vector => b.ptr[i],
             .Number => @splat(b),
         };
@@ -510,10 +336,10 @@ fn apply_bool(
             .Neq => a_vek != b_vek,
         };
         if (mode == .Grow) {
-            const a_nans = a_vek == ninf;
-            c.ptr[i] = @select(num_t, a_nans, b_vek, c.ptr[i]);
-            const b_nans = b_vek == ninf;
-            c.ptr[i] = @select(num_t, b_nans, a_vek, c.ptr[i]);
+            const a_nans = nans_vek(T, a, i);
+            c.ptr[i] = @select(T, a_nans, b_vek, c.ptr[i]);
+            const b_nans = nans_vek(T, b, i);
+            c.ptr[i] = @select(T, b_nans, a_vek, c.ptr[i]);
         }
     }
 }
@@ -554,63 +380,64 @@ pub const SimdOp3 = enum {
 //TODO rewrite test w new framework
 test "basic add" {
     const num_t = f64;
-    const ninf = -std.math.inf(num_t);
-    var a_arr = [_]Vek(num_t){ .{ 0, 1, 7, 69, 420, 666, 6969, 50 }, .{ 100, 10, 20, ninf, ninf, ninf, ninf, ninf } };
-    const a: Stream(num_t) = .{
-        .ptr = &a_arr,
-        .stop = 11,
-    };
-    var b_arr = [_]Vek(num_t){ .{ 0, 1, 3, 96, 580, 444, 9696, 50 }, .{ 100, 10, 20, ninf, ninf, ninf, ninf, ninf } };
-    const b: Stream(num_t) = .{
-        .ptr = &b_arr,
-        .stop = 11,
-    };
-    var c_expect_arr = [_]Vek(num_t){ .{ 0, 2, 10, 165, 1000, 1110, 16665, 100 }, .{ 200, 20, 40, ninf, ninf, ninf, ninf, ninf } };
-    const c_expect: Stream(num_t) = .{
-        .ptr = &c_expect_arr,
-        .stop = 11,
-    };
-    var c_actual_arr: [2]Vek(num_t) = undefined;
-    @memset(&c_actual_arr, @splat(ninf));
-    var c_actual: Stream(num_t) = .{
-        .ptr = &c_actual_arr,
-    };
-    apply(num_t, .Add, .Strict, &c_actual, .Vector, a, .Vector, b);
-    // print_vek(num_t, c_expect);
-    // print_vek(num_t, c_actual);
-    try testing.expectEqualSlices(Vek(num_t), c_expect.ptr, c_actual.ptr);
-    try testing.expectEqual(c_expect.start, c_actual.start);
-    try testing.expectEqual(c_expect.stop, c_actual.stop);
+
+    var beig_buffer: [1024]u8 = undefined;
+    const state_res = init(&beig_buffer, 1024);
+    if (state_res.err != 0) {
+        unreachable;
+    }
+    const state = state_res.ok;
+    var streams = try make(num_t, state.allocator, 11, 4);
+
+    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = slice_to_stream(num_t, &streams, &a_arr, 0);
+
+    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
+    const b_stream = slice_to_stream(num_t, &streams, &b_arr, 0);
+
+    var c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
+    const c_expect_stream = slice_to_stream(num_t, &streams, &c_expect_arr, 0);
+
+    var c_actual_stream = new_stream(num_t, &streams);
+    apply(num_t, .Add, .Strict, &c_actual_stream, .Vector, a_stream, .Vector, b_stream);
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
 }
 
-//TODO rewrite test w new framework
-test "grow add" {
-    const num_t = f64;
-    const ninf = -std.math.inf(num_t);
-    var a_arr = [_]Vek(num_t){ .{ 0, 1, 7, 69, 420, 666, 6969, 50 }, .{ 100, 10, 20, ninf, ninf, ninf, ninf, ninf } };
-    const a: Stream(num_t) = .{
-        .ptr = &a_arr,
-        .stop = 11,
-    };
-    var b_arr = [_]Vek(num_t){ .{ 0, 1, 3, 96, 580, 444, 9696, 50 }, .{ 100, 10, 20, 30, ninf, ninf, ninf, ninf } };
-    const b: Stream(num_t) = .{
-        .ptr = &b_arr,
-        .stop = 11,
-    };
-    var c_expect_arr = [_]Vek(num_t){ .{ 0, 2, 10, 165, 1000, 1110, 16665, 100 }, .{ 200, 20, 40, 30, ninf, ninf, ninf, ninf } };
-    const c_expect: Stream(num_t) = .{
-        .ptr = &c_expect_arr,
-        .stop = 11,
-    };
-    var c_actual_arr: [2]Vek(num_t) = undefined;
-    @memset(&c_actual_arr, @splat(ninf));
-    var c_actual: Stream(num_t) = .{
-        .ptr = &c_actual_arr,
-    };
-    apply(num_t, .Add, .Grow, &c_actual, .Vector, a, .Vector, b);
-    print_vek(num_t, c_expect);
-    print_vek(num_t, c_actual);
-    try testing.expectEqualSlices(Vek(num_t), c_expect.ptr, c_actual.ptr);
-    try testing.expectEqual(c_expect.start, c_actual.start);
-    try testing.expectEqual(c_expect.stop, c_actual.stop);
+// //TODO rewrite test w new framework
+// test "grow add" {
+//     const num_t = f64;
+//     const ninf = -std.math.inf(num_t);
+//     var a_arr = [_]Vek(num_t){ .{ 0, 1, 7, 69, 420, 666, 6969, 50 }, .{ 100, 10, 20, ninf, ninf, ninf, ninf, ninf } };
+//     const a: Stream(num_t) = .{
+//         .ptr = &a_arr,
+//         .stop = 11,
+//     };
+//     var b_arr = [_]Vek(num_t){ .{ 0, 1, 3, 96, 580, 444, 9696, 50 }, .{ 100, 10, 20, 30, ninf, ninf, ninf, ninf } };
+//     const b: Stream(num_t) = .{
+//         .ptr = &b_arr,
+//         .stop = 11,
+//     };
+//     var c_expect_arr = [_]Vek(num_t){ .{ 0, 2, 10, 165, 1000, 1110, 16665, 100 }, .{ 200, 20, 40, 30, ninf, ninf, ninf, ninf } };
+//     const c_expect: Stream(num_t) = .{
+//         .ptr = &c_expect_arr,
+//         .stop = 11,
+//     };
+//     var c_actual_arr: [2]Vek(num_t) = undefined;
+//     @memset(&c_actual_arr, @splat(ninf));
+//     var c_actual: Stream(num_t) = .{
+//         .ptr = &c_actual_arr,
+//     };
+//     apply(num_t, .Add, .Grow, &c_actual, .Vector, a, .Vector, b);
+//     print_vek(num_t, c_expect);
+//     print_vek(num_t, c_actual);
+//     try testing.expectEqualSlices(Vek(num_t), c_expect.ptr, c_actual.ptr);
+//     try testing.expectEqual(c_expect.start, c_actual.start);
+//     try testing.expectEqual(c_expect.stop, c_actual.stop);
+// }
+
+// #region EXPORTS!!!
+pub export fn add(c: *Stream(f64), a: Stream(f64), b: Stream(f64)) void {
+    apply(f64, .Add, .Strict, c, .Vector, a, .Vector, b);
 }
