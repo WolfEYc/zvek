@@ -82,10 +82,10 @@ pub fn Vek(comptime T: type) type {
 pub fn Stream(comptime T: type) type {
     return extern struct {
         ptr: [*]Vek(T),
-        start: usize = 0,
-        stop: usize = 0,
+        len: usize = 0,
     };
 }
+pub const StreamAllocator = extern struct { allocator: Allocator };
 pub const Range = extern struct {
     start: usize = 0,
     stop: usize = 0,
@@ -96,19 +96,7 @@ pub fn stream_iter(comptime T: type, stream: Stream(T)) Range {
         .stop = (stream.stop - 1) / lanes(T) + 1,
     };
 }
-pub fn Streams(comptime T: type) type {
-    return extern struct {
-        streams_ptr: [*]Vek(T),
-        ranges_ptr: [*]Range,
-        veks_per_stream: usize,
-        len: usize,
-        cap: usize,
-    };
-}
 
-pub const State = struct {
-    allocator: Allocator,
-};
 pub fn Result(comptime T: type) type {
     return extern struct {
         ok: T,
@@ -127,27 +115,9 @@ pub fn resultify(comptime T: type, res: anyerror!T) Result(T) {
     }
 }
 
-pub export fn init(buf_ptr: [*]u8, len: usize) Result(*State) {
-    const buf = buf_ptr[0..len];
-    var fba = std.heap.FixedBufferAllocator.init(buf);
-    const allocator = fba.threadSafeAllocator();
-    const state = allocator.create(State) catch |err| return errify(*State, err);
-    state.allocator = allocator;
-    return Result(*State){ .ok = state };
-}
-
-pub fn make(comptime T: type, allocator: Allocator, stream_size: usize, num_streams: usize) Allocator.Error!Streams(T) {
-    const veks_per_stream = ceildiv(stream_size, lanes(T));
-    const veks_cap = veks_per_stream * num_streams;
-    const streams = try allocator.alloc(Vek(T), veks_cap);
-    const ranges = try allocator.alloc(Range, num_streams);
-    return Streams(T){
-        .streams_ptr = streams.ptr,
-        .ranges_ptr = ranges.ptr,
-        .veks_per_stream = veks_per_stream,
-        .len = 0,
-        .cap = num_streams,
-    };
+pub fn make(buf: []u8) StreamAllocator {
+    var arena = std.heap.FixedBufferAllocator.init(buf);
+    return StreamAllocator{ .allocator = arena.allocator() };
 }
 pub export fn make_f64(s: *State, stream_len: usize, num_streams: usize) Result(Streams(f64)) {
     return resultify(Streams(f64), make(f64, s.allocator, stream_len, num_streams));
@@ -159,26 +129,16 @@ pub export fn make_i64(s: *State, stream_len: usize, num_streams: usize) Result(
     return resultify(Streams(i64), make(i64, s.allocator, stream_len, num_streams));
 }
 
-pub fn to_stream(comptime T: type, streams: *Streams(T), slice: []T, start_idx: usize) Stream(T) {
-    var stream = new_stream(T, streams);
+pub fn to_stream(comptime T: type, slice: []T) Stream(T) {
+    var stream = new_stream(T, slice.len);
     set_stream(T, &stream, slice, start_idx);
     return stream;
 }
 
-pub fn new_stream(comptime T: type, streams: *Streams(T)) Stream(T) {
-    const stream = get_stream(T, streams, streams.len);
-    streams.len += 1;
-    return stream;
-}
-pub fn get_stream(comptime T: type, streams: *Streams(T), i: usize) Stream(T) {
-    assert(i < streams.cap);
-    const ptr_start = i * streams.veks_per_stream;
-    const ptr = streams.streams_ptr + ptr_start;
-    const range = streams.ranges_ptr[i];
+pub fn new_stream(comptime T: type, size: usize) Stream(T) {
     return Stream(T){
         .ptr = ptr,
         .start = range.start,
-        .stop = range.stop,
     };
 }
 pub fn set_stream(comptime T: type, stream: *Stream(T), slice: []T, start_idx: usize) void {
