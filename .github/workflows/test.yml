@@ -1,0 +1,22 @@
+name: build
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: macos/arm64
+            zig_target: aarch64-macos
+          - target: linux/amd64
+            zig_target: x86_64-linux
+      steps:
+        - uses: actions/checkout@v4
+        - uses: mlugg/setup-zig@v2
+        - run: |
+            zig build test -Dtarget=${{ matrix.zig_target }}
+
