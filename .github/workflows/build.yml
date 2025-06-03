@@ -6,24 +6,19 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - target: macos/arm64
-            runner: macos-latest
-            zig_target: aarch64-macos
+          - target: aarch64-macos
             out_name: libzvek.dylib
-
-          - target: linux/amd64
-            runner: ubuntu-latest
-            zig_target: x86_64-linux
+          - target: x86_64-linux
             out_name: libzvek.so
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
       - run: |
-          zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
       - uses: actions/upload-artifact@v4
         with:
           path: zig-out/lib/${{ matrix.out_name }}

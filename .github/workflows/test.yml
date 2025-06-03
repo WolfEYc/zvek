@@ -5,17 +5,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - target: macos/arm64
-            zig_target: aarch64-macos
-          - target: linux/amd64
-            zig_target: x86_64-linux
+          - target: aarch64-macos
+            runner: macos-latest
+          - target: x86_64-linux
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
       - run: |
-          zig build test -Dtarget=${{ matrix.zig_target }}
+          zig build test -Dtarget=${{ matrix.target }}
 
