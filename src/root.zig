@@ -145,32 +145,38 @@ fn to_slice(comptime T: type, s: Stream(T)) []T {
     return slice[0..s.len_scalars];
 }
 
-pub fn apply(
+fn Apply_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
+    return extern struct {
+        a: Operand(T, a_t),
+        b: Operand(T, b_t),
+        c: Stream(T),
+    };
+}
+
+pub inline fn apply(
     comptime T: type,
     comptime op: Simd_Op,
-    c: *Stream(T),
     comptime a_t: Operand_Variant,
-    a: Operand(T, a_t),
     comptime b_t: Operand_Variant,
-    b: Operand(T, b_t),
+    args: Apply_Args(T, a_t, b_t),
 ) void {
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
     if (a_t == .Vector and b_t == .Vector) {
-        assert(a.len_veks == b.len_veks and b.len_veks == c.len_veks);
+        assert(args.a.len_veks == args.b.len_veks and args.b.len_veks == args.c.len_veks);
     }
 
-    for (0..c.len_veks) |i| {
+    for (0..args.c.len_veks) |i| {
         const a_vek: Vek(T) = switch (a_t) {
-            .Vector => a.veks[i],
-            .Number => @splat(a),
+            .Vector => args.a.veks[i],
+            .Number => @splat(args.a),
         };
         const b_vek: Vek(T) = switch (b_t) {
-            .Vector => b.veks[i],
-            .Number => @splat(b),
+            .Vector => args.b.veks[i],
+            .Number => @splat(args.b),
         };
-        c.veks[i] = switch (op) {
+        args.c.veks[i] = switch (op) {
             .Add => a_vek + b_vek,
             .Sub => a_vek - b_vek,
             .Div => a_vek / b_vek,
@@ -294,8 +300,13 @@ test "basic add" {
     var c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
     const c_expect_stream = to_stream(num_t, ctx, &c_expect_arr);
 
-    var c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
-    apply(num_t, .Add, &c_actual_stream, .Vector, a_stream, .Vector, b_stream);
+    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
+    const args = Apply_Args(num_t, .Vector, .Vector){
+        .a = a_stream,
+        .b = b_stream,
+        .c = c_actual_stream,
+    };
+    apply(num_t, .Add, .Vector, .Vector, args);
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
     try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
@@ -340,8 +351,8 @@ fn generate_apply_func(
         name = name ++ "_num";
     }
     @export(&struct {
-        fn generated(c: *Stream(T), a: Operand(T, a_t), b: Operand(T, b_t)) callconv(.C) void {
-            apply(T, op, c, a_t, a, b_t, b);
+        fn generated(args: *Apply_Args(T, a_t, b_t)) callconv(.C) void {
+            apply(T, op, a_t, b_t, args.*);
         }
     }.generated, .{ .name = name });
 }
