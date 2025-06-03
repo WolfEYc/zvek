@@ -11,11 +11,17 @@ jobs:
       matrix:
         include:
           - target: aarch64-macos
-            out_name: libzvek.dylib
+            out_name: libzvek-arm64-m1.dylib
             cpu: apple_m1
           - target: x86_64-linux
-            out_name: libzvek.so
-            cpu: haswell
+            out_name: libzvek-amd64-haswell.so
+            cpu: haswell # amd64 compatibility build
+          - target: x86_64-linux
+            out_name: libzvek-amd64-zen4.so
+            cpu: znver4  # amd64 zen4 build
+          - target: aarch64-linux
+            out_name: libzvek-arm64-neoverse-v2.so
+            cpu: neoverse_v2 # AWS Graviton4
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
