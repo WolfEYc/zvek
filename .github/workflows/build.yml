@@ -21,4 +21,5 @@ jobs:
           zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
       - uses: actions/upload-artifact@v4
         with:
+          name: ${{ matrix.target }} dylib
           path: zig-out/lib/${{ matrix.out_name }}
