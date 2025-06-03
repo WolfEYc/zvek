@@ -6,14 +6,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - target: macos/arm64
+            runner: macos-latest
             zig_target: aarch64-macos
             out_name: libzvek.dylib
+
           - target: linux/amd64
+            runner: ubuntu-latest
             zig_target: x86_64-linux
             out_name: libzvek.so
     steps:
