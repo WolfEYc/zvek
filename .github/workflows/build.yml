@@ -16,11 +16,11 @@ jobs:
           - target: linux/amd64
             zig_target: x86_64-linux
             out_name: libzvek.so
-      steps:
-        - uses: actions/checkout@v4
-        - uses: mlugg/setup-zig@v2
-        - run: |
-            zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast
-        - uses: actions/upload-artifact@v4
-          with:
-            path: zig-out/lib/${{ matrix.out_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+      - run: |
+          zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast
+      - uses: actions/upload-artifact@v4
+        with:
+          path: zig-out/lib/${{ matrix.out_name }}
