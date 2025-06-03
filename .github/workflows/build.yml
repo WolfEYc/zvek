@@ -12,7 +12,7 @@ jobs:
         include:
           - target: aarch64-macos
             out_name: libzvek.dylib
-            cpu: apple-m1
+            cpu: apple_m1
           - target: x86_64-linux
             out_name: libzvek.so
             cpu: haswell
