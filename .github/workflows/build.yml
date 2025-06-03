@@ -12,13 +12,15 @@ jobs:
         include:
           - target: aarch64-macos
             out_name: libzvek.dylib
+            cpu: apple-m1
           - target: x86_64-linux
             out_name: libzvek.so
+            cpu: haswell
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
       - run: |
-          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }}
       - uses: softprops/action-gh-release@v2
         with:
           files: zig-out/lib/${{ matrix.out_name }}
