@@ -11,23 +11,23 @@ jobs:
       matrix:
         include:
           - target: aarch64-macos
-            out_name: libzvek-arm64-m1.dylib
             cpu: apple_m1
           - target: x86_64-linux
-            out_name: libzvek-amd64-haswell.so
             cpu: haswell # amd64 compatibility build
           - target: x86_64-linux
-            out_name: libzvek-amd64-zen4.so
             cpu: znver4  # amd64 zen4 build
           - target: aarch64-linux
-            out_name: libzvek-arm64-neoverse-v2.so
             cpu: neoverse_v2 # AWS Graviton4
+    env:
+      TAR_NAME: libzvek-${{ matrix.target }}-${{ matrix.cpu }}.tar.gz 
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
       - run: |
           zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }}
+      - run: |
+          tar -czf ${{ env.TAR_NAME }} -C zig-out/lib .
       - uses: softprops/action-gh-release@v2
         with:
-          files: zig-out/lib/${{ matrix.out_name }}
+          files: ${{ env.TAR_NAME }}
           token: ${{ secrets.GITHUB_TOKEN }}
