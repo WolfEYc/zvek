@@ -47,6 +47,10 @@ const float_types = [_]type{
     f32, f64,
 };
 
+const unsigned_types = [_]type{
+    u8, u16, u32, u64,
+};
+
 pub const Operand_Variant = enum {
     Vector,
     Number,
@@ -82,6 +86,13 @@ pub fn Vek(comptime T: type) type {
 pub fn Stream(comptime T: type) type {
     return extern struct {
         veks: [*]Vek(T),
+        len_veks: usize,
+        len_scalars: usize,
+    };
+}
+pub fn Fixed_Stream(comptime T: type, comptime lane_count: usize) type {
+    return extern struct {
+        veks: [*]@Vector(lane_count, T),
         len_veks: usize,
         len_scalars: usize,
     };
@@ -205,7 +216,7 @@ pub inline fn apply(
     }
 }
 
-pub const BoolOp = enum {
+pub const Simd_Bool_Op = enum {
     Gt,
     Gte,
     Lt,
@@ -214,35 +225,38 @@ pub const BoolOp = enum {
     Neq,
 };
 
-pub fn apply_bool(
+fn Apply_Bool_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
+    return extern struct {
+        a: Operand(T, a_t),
+        b: Operand(T, b_t),
+        c: Fixed_Stream(bool, lanes(T)),
+    };
+}
+
+pub inline fn apply_bool(
     comptime T: type,
-    comptime Op: BoolOp,
-    c: *Stream(bool),
+    comptime Op: Simd_Bool_Op,
     comptime a_t: Operand_Variant,
-    a: Operand(T, a_t),
     comptime b_t: Operand_Variant,
-    b: Operand(T, b_t),
+    args: Apply_Bool_Args(T, a_t, b_t),
 ) void {
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
     if (a_t == .Vector and b_t == .Vector) {
-        assert(a.len_veks == b.len_veks and b.len_veks == c.len_veks);
+        assert(args.a.len_scalars == args.b.len_scalars and args.b.len_scalars == args.c.len_scalars);
     }
 
-    const vek_start = c.start / lanes(T);
-    const vek_end = (c.stop - 1) / lanes(T) + 1;
-
-    for (vek_start..vek_end) |i| {
+    for (0..args.c.len_veks) |i| {
         const a_vek: Vek(T) = switch (a_t) {
-            .Vector => a.veks[i],
-            .Number => @splat(a),
+            .Vector => args.a.veks[i],
+            .Number => @splat(args.a),
         };
         const b_vek: Vek(T) = switch (b_t) {
-            .Vector => b.veks[i],
-            .Number => @splat(b),
+            .Vector => args.b.veks[i],
+            .Number => @splat(args.b),
         };
-        c.veks[i] = switch (Op) {
+        args.c.veks[i] = switch (Op) {
             .Gt => a_vek > b_vek,
             .Gte => a_vek >= b_vek,
             .Lt => a_vek < b_vek,
@@ -253,30 +267,65 @@ pub fn apply_bool(
     }
 }
 
-pub const SimdOp1 = enum {
+pub const Simd_Op1 = enum {
     Ceil,
     Floor,
     Round,
     Sqrt,
     Not,
     Neg,
+    // Abs,
+    Ln,
+    Log2,
+    Log10,
+    Exp,
+    Exp2,
 };
 
-pub fn apply_single(
-    comptime num_t: type,
-    comptime Op: SimdOp1,
-    c: *Stream(num_t),
+const simd_float_op_1s = [_]Simd_Op1{
+    .Ln,
+    .Log2,
+    .Log10,
+    .Exp,
+    .Exp2,
+    .Sqrt,
+    .Ceil,
+    .Floor,
+    .Round,
+};
+
+const signed_op_1s = [_]Simd_Op1{
+    .Neg,
+    // .Abs,
+};
+
+pub inline fn apply_single(
+    comptime T: type,
+    comptime Op: Simd_Op1,
+    c: Stream(T),
 ) void {
-    const vek_start = c.start / lanes(num_t);
-    const vek_end = (c.stop - 1) / lanes(num_t) + 1;
-    for (vek_start..vek_end) |i| {
+    for (0..c.len_veks) |i| {
         c.veks[i] = switch (Op) {
             .Ceil => @ceil(c.veks[i]),
             .Floor => @floor(c.veks[i]),
             .Round => @round(c.veks[i]),
             .Sqrt => @sqrt(c.veks[i]),
-            .Not => ~c.veks[i],
+            .Not => blk: {
+                var c_bits: @Vector(TARGET_SIMD_BITS, u1) = @bitCast(c.veks[i]);
+                c_bits = switch (Op) {
+                    .Not => ~c_bits,
+                    else => comptime unreachable,
+                };
+                const c_vek: Vek(T) = @bitCast(c_bits);
+                break :blk c_vek;
+            },
             .Neg => -c.veks[i],
+            // .Abs => @abs(c.veks[i]),
+            .Ln => @log(c.veks[i]),
+            .Log2 => @log2(c.veks[i]),
+            .Log10 => @log10(c.veks[i]),
+            .Exp => @exp(c.veks[i]),
+            .Exp2 => @exp2(c.veks[i]),
         };
     }
 }
@@ -321,18 +370,51 @@ comptime {
             is_float_t = true;
             break;
         }
-        op_loop: for (@typeInfo(Simd_Op).@"enum".fields) |op| {
+        var is_signed_type = true;
+        for (unsigned_types) |u_type| {
+            if (t != u_type) continue;
+            is_signed_type = false;
+            break;
+        }
+        // normal apply
+        normal_loop: for (@typeInfo(Simd_Op).@"enum".fields) |op| {
             const op_enum: Simd_Op = @enumFromInt(op.value);
             if (!is_float_t) {
                 for (simd_float_ops) |float_op| {
                     if (op_enum == float_op) {
-                        continue :op_loop;
+                        continue :normal_loop;
                     }
                 }
             }
             generate_apply_func(t, op_enum, .Vector, .Vector);
             generate_apply_func(t, op_enum, .Vector, .Number);
             generate_apply_func(t, op_enum, .Number, .Vector);
+        }
+        // bool
+        for (@typeInfo(Simd_Bool_Op).@"enum".fields) |op| {
+            const op_enum: Simd_Bool_Op = @enumFromInt(op.value);
+            generate_apply_bool_func(t, op_enum, .Vector, .Vector);
+            generate_apply_bool_func(t, op_enum, .Vector, .Number);
+            generate_apply_bool_func(t, op_enum, .Number, .Vector);
+        }
+        // single apply
+        single_loop: for (@typeInfo(Simd_Op1).@"enum".fields) |op| {
+            const op_enum: Simd_Op1 = @enumFromInt(op.value);
+            if (!is_float_t) {
+                for (simd_float_op_1s) |float_op| {
+                    if (op_enum == float_op) {
+                        continue :single_loop;
+                    }
+                }
+            }
+            if (!is_signed_type) {
+                for (signed_op_1s) |signed_op| {
+                    if (op_enum == signed_op) {
+                        continue :single_loop;
+                    }
+                }
+            }
+            generate_apply_single_func(t, op_enum);
         }
     }
 }
@@ -353,6 +435,37 @@ fn generate_apply_func(
     @export(&struct {
         fn generated(args: *Apply_Args(T, a_t, b_t)) callconv(.C) void {
             apply(T, op, a_t, b_t, args.*);
+        }
+    }.generated, .{ .name = name });
+}
+
+fn generate_apply_bool_func(
+    comptime T: type,
+    comptime op: Simd_Bool_Op,
+    comptime a_t: Operand_Variant,
+    comptime b_t: Operand_Variant,
+) void {
+    var name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
+    if (a_t == .Number) {
+        name = "num_" ++ name;
+    }
+    if (b_t == .Number) {
+        name = name ++ "_num";
+    }
+    @export(&struct {
+        fn generated(args: *Apply_Bool_Args(T, a_t, b_t)) callconv(.C) void {
+            apply_bool(T, op, a_t, b_t, args.*);
+        }
+    }.generated, .{ .name = name });
+}
+fn generate_apply_single_func(
+    comptime T: type,
+    comptime op: Simd_Op1,
+) void {
+    const name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
+    @export(&struct {
+        fn generated(stream: Stream(T)) callconv(.C) void {
+            apply_single(T, op, stream);
         }
     }.generated, .{ .name = name });
 }
