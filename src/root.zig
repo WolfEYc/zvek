@@ -63,6 +63,12 @@ fn print_vek(comptime T: type, v: Stream(T)) void {
     }
     std.debug.print("\n", .{});
 }
+fn print_vector(comptime T: type, comptime L: comptime_int, v: @Vector(L, T)) void {
+    for (0..L) |i| {
+        std.debug.print("{d:.2} ", .{v[i]});
+    }
+    std.debug.print("\n", .{});
+}
 
 fn ceildiv(x: usize, y: usize) usize {
     return x / y + @intFromBool(x % y != 0);
@@ -280,7 +286,7 @@ pub const Simd_Op1 = enum {
     Log10,
     Exp,
     Exp2,
-    FloatCast,
+    Cast,
 };
 
 const simd_float_op_1s = [_]Simd_Op1{
@@ -293,7 +299,7 @@ const simd_float_op_1s = [_]Simd_Op1{
     .Ceil,
     .Floor,
     .Round,
-    .FloatCast,
+    .Cast,
 };
 
 const signed_op_1s = [_]Simd_Op1{
@@ -313,33 +319,25 @@ fn unsigned_variant(comptime T: type) type {
     };
 }
 
-fn float_cast_type(comptime T: type) type {
-    return switch (T) {
-        f32 => f64,
-        f64 => f32,
-        else => comptime unreachable,
-    };
-}
-
-fn apply_type(comptime T: type, comptime Op: Simd_Op1) type {
-    return switch (Op) {
-        .Abs => unsigned_variant(T),
-        .FloatCast => float_cast_type(T),
-        else => T,
-    };
-}
-
-fn Apply_Args_Single(comptime T: type, comptime Op: Simd_Op1) type {
+fn Apply_Args_Single(comptime T: type, comptime O: type) type {
     return extern struct {
         x: Stream(T),
-        y: Stream(apply_type(T, Op)),
+        y: Stream(O),
     };
 }
+
+fn is_suported_cast(comptime T: type, comptime O: type) bool {}
+
+const supported_casts = [_][2]type{
+    [2]type{ u8, u16 },
+    [2]type{ u8, u32 },
+};
 
 pub inline fn apply_single(
     comptime T: type,
+    comptime O: type,
     comptime Op: Simd_Op1,
-    args: Apply_Args_Single(T, Op),
+    args: Apply_Args_Single(T, O),
 ) void {
     assert(args.x.len_scalars == args.y.len_scalars);
     for (0..args.y.len_veks) |i| {
@@ -364,26 +362,44 @@ pub inline fn apply_single(
             .Log10 => @log10(args.x.veks[i]),
             .Exp => @exp(args.x.veks[i]),
             .Exp2 => @exp2(args.x.veks[i]),
-            .FloatCast => blk: {
-                const f32_lanes = lanes(f32);
-                const f64_lanes = lanes(f64);
-                switch (T) {
-                    f32 => {
-                        const jump_dist = (i % 2) * f64_lanes;
-                        const full_f32_src: [f32_lanes]f32 = args.x.veks[i / 2];
-                        const half_f32_src: @Vector(f64_lanes, f32) = full_f32_src[jump_dist..][0..f64_lanes].*;
-                        const full_f64_out: @Vector(f64_lanes, f64) = @floatCast(half_f32_src);
-                        break :blk full_f64_out;
+            .Cast => blk: {
+                const Cast_Op = enum {
+                    EQ,
+                    PROMOTION,
+                    DEMOTION,
+                };
+                const in_lanes = lanes(T);
+                const out_lanes = lanes(O);
+                const cast_op: Cast_Op = op_blk: {
+                    if (in_lanes == out_lanes) {
+                        break :op_blk .EQ;
+                    }
+                    if (in_lanes > out_lanes) {
+                        break :op_blk .PROMOTION;
+                    }
+                    break :op_blk .DEMOTION;
+                };
+                switch (cast_op) {
+                    .EQ => {
+                        break :blk @as(O, args.x.veks[i]);
                     },
-                    f64 => {
-                        const f32_vek_1: @Vector(f64_lanes, f32) = @floatCast(args.x.veks[i * 2]);
-                        const f32_vek_2: @Vector(f64_lanes, f32) = @floatCast(args.x.veks[i * 2 + 1]);
-                        var f32_vek_all: [f32_lanes]f32 = undefined;
-                        f32_vek_all[0..f64_lanes].* = f32_vek_1;
-                        f32_vek_all[f64_lanes..f32_lanes].* = f32_vek_2;
-                        break :blk f32_vek_all;
+                    .PROMOTION => {
+                        const ratio = in_lanes / out_lanes;
+                        const jump_dist = (i % ratio) * out_lanes;
+                        const full_in_src: [in_lanes]T = args.x.veks[i / ratio];
+                        const slice_in_src: @Vector(out_lanes, T) = full_in_src[jump_dist..][0..out_lanes].*;
+                        break :blk @as(@Vector(out_lanes, O), slice_in_src);
                     },
-                    else => comptime unreachable,
+                    .DEMOTION => {
+                        // const ratio = out_lanes / in_lanes;
+                        const full_out_arr: [out_lanes]O = undefined;
+                        // inline for (0..ratio) |j| {
+                        //     // const out_jump = j * in_lanes;
+                        //     const in_idx = i * ratio + j;
+                        //     // full_out_arr[out_jump..][0..in_lanes].* = @as(@Vector(in_lanes, O), args.x.veks[in_idx]);
+                        // }
+                        break :blk full_out_arr;
+                    },
                 }
             },
         };
@@ -394,52 +410,6 @@ pub inline fn apply_single(
 pub const SimdOp3 = enum {
     Fma,
 };
-
-test "basic add" {
-    const num_t = f64;
-
-    const ctx = make(1024);
-
-    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(num_t, ctx, &a_arr);
-
-    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const b_stream = to_stream(num_t, ctx, &b_arr);
-
-    var c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
-    const c_expect_stream = to_stream(num_t, ctx, &c_expect_arr);
-
-    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
-    const args = Apply_Args(num_t, .Vector, .Vector){
-        .a = a_stream,
-        .b = b_stream,
-        .c = c_actual_stream,
-    };
-    apply(num_t, .Add, .Vector, .Vector, args);
-    // print_vek(num_t, c_expect_stream);
-    // print_vek(num_t, c_actual_stream);
-    try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
-}
-
-test "f32 -> f64 cast" {
-    const ctx = make(1024);
-
-    var a_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(f32, ctx, &a_arr);
-
-    var b_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const b_stream = to_stream(f64, ctx, &b_arr);
-
-    const b_actual_stream = new_stream(f64, ctx, b_stream.len_scalars);
-    const args = Apply_Args_Single(f32, .FloatCast){
-        .x = a_stream,
-        .y = b_stream,
-    };
-    apply_single(f32, .FloatCast, args);
-    // print_vek(num_t, c_expect_stream);
-    // print_vek(num_t, c_actual_stream);
-    try testing.expectEqualSlices(f64, to_slice(f64, b_stream), to_slice(f64, b_actual_stream));
-}
 
 comptime {
     @setEvalBranchQuota(4096);
@@ -480,6 +450,9 @@ comptime {
         // single apply
         single_loop: for (@typeInfo(Simd_Op1).@"enum".fields) |op| {
             const op_enum: Simd_Op1 = @enumFromInt(op.value);
+            if (op_enum == .Cast) {
+                continue :single_loop;
+            }
             if (!is_float_t) {
                 for (simd_float_op_1s) |float_op| {
                     if (op_enum == float_op) {
@@ -494,7 +467,17 @@ comptime {
                     }
                 }
             }
-            generate_apply_single_func(t, op_enum);
+            const out_t = switch (op_enum) {
+                .Abs => unsigned_variant(t),
+                else => t,
+            };
+            generate_apply_single_func(t, out_t, op_enum);
+        }
+        for (number_types) |cast_t| {
+            if (cast_t == t) {
+                continue;
+            }
+            generate_apply_single_func(t, cast_t, .Cast);
         }
     }
 }
@@ -540,12 +523,79 @@ fn generate_apply_bool_func(
 }
 fn generate_apply_single_func(
     comptime T: type,
+    comptime O: type,
     comptime op: Simd_Op1,
 ) void {
-    const name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
+    var name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
+    if (T != O) {
+        name = name ++ "_" ++ @typeName(O);
+    }
     @export(&struct {
-        fn generated(args: *Apply_Args_Single(T, op)) callconv(.C) void {
-            apply_single(T, op, args.*);
+        fn generated(args: *Apply_Args_Single(T, O)) callconv(.C) void {
+            apply_single(T, O, op, args.*);
         }
     }.generated, .{ .name = name });
+}
+
+test "basic add" {
+    const num_t = f64;
+
+    const ctx = make(1024);
+
+    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = to_stream(num_t, ctx, &a_arr);
+
+    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
+    const b_stream = to_stream(num_t, ctx, &b_arr);
+
+    var c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
+    const c_expect_stream = to_stream(num_t, ctx, &c_expect_arr);
+
+    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
+    const args = Apply_Args(num_t, .Vector, .Vector){
+        .a = a_stream,
+        .b = b_stream,
+        .c = c_actual_stream,
+    };
+    apply(num_t, .Add, .Vector, .Vector, args);
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
+}
+
+test "f32 -> f64 cast" {
+    const ctx = make(1024);
+
+    var a_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = to_stream(f32, ctx, &a_arr);
+
+    const b_actual_stream = new_stream(f64, ctx, a_stream.len_scalars);
+    const args = Apply_Args_Single(f32, f64){
+        .x = a_stream,
+        .y = b_actual_stream,
+    };
+    apply_single(f32, f64, .Cast, args);
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    var b_expect_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const b_expect_stream = to_stream(f64, ctx, &b_expect_arr);
+    try testing.expectEqualSlices(f64, to_slice(f64, b_expect_stream), to_slice(f64, b_actual_stream));
+}
+test "f64 -> f32 cast" {
+    const ctx = make(1024);
+
+    var a_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = to_stream(f64, ctx, &a_arr);
+
+    const b_actual_stream = new_stream(f32, ctx, a_stream.len_scalars);
+    const args = Apply_Args_Single(f64, f32){
+        .x = a_stream,
+        .y = b_actual_stream,
+    };
+    apply_single(f64, f32, .Cast, args);
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    var b_expect_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const b_expect_stream = to_stream(f32, ctx, &b_expect_arr);
+    try testing.expectEqualSlices(f32, to_slice(f32, b_expect_stream), to_slice(f32, b_actual_stream));
 }
