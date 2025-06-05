@@ -76,7 +76,7 @@ fn print_float_slice(comptime T: type, s: []T) void {
 }
 
 pub const TARGET_SIMD_BYTES: comptime_int = 64; // AVX512
-pub fn lanes(comptime T: type) usize {
+pub fn lanes(comptime T: type) comptime_int {
     return TARGET_SIMD_BYTES / @sizeOf(T);
 }
 
@@ -175,7 +175,7 @@ pub inline fn apply(
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
     if (a_t == .Vector and b_t == .Vector) {
-        assert(args.a.len_veks == args.b.len_veks and args.b.len_veks == args.c.len_veks);
+        assert(args.a.len_scalars == args.b.len_scalars and args.b.len_scalars == args.c.len_scalars);
     }
 
     for (0..args.c.len_veks) |i| {
@@ -280,6 +280,7 @@ pub const Simd_Op1 = enum {
     Log10,
     Exp,
     Exp2,
+    FloatCast,
 };
 
 const simd_float_op_1s = [_]Simd_Op1{
@@ -292,6 +293,7 @@ const simd_float_op_1s = [_]Simd_Op1{
     .Ceil,
     .Floor,
     .Round,
+    .FloatCast,
 };
 
 const signed_op_1s = [_]Simd_Op1{
@@ -311,9 +313,18 @@ fn unsigned_variant(comptime T: type) type {
     };
 }
 
+fn float_cast_type(comptime T: type) type {
+    return switch (T) {
+        f32 => f64,
+        f64 => f32,
+        else => comptime unreachable,
+    };
+}
+
 fn apply_type(comptime T: type, comptime Op: Simd_Op1) type {
     return switch (Op) {
         .Abs => unsigned_variant(T),
+        .FloatCast => float_cast_type(T),
         else => T,
     };
 }
@@ -330,6 +341,7 @@ pub inline fn apply_single(
     comptime Op: Simd_Op1,
     args: Apply_Args_Single(T, Op),
 ) void {
+    assert(args.x.len_scalars == args.y.len_scalars);
     for (0..args.y.len_veks) |i| {
         args.y.veks[i] = switch (Op) {
             .Ceil => @ceil(args.x.veks[i]),
@@ -352,6 +364,28 @@ pub inline fn apply_single(
             .Log10 => @log10(args.x.veks[i]),
             .Exp => @exp(args.x.veks[i]),
             .Exp2 => @exp2(args.x.veks[i]),
+            .FloatCast => blk: {
+                const f32_lanes = lanes(f32);
+                const f64_lanes = lanes(f64);
+                switch (T) {
+                    f32 => {
+                        const jump_dist = (i % 2) * f64_lanes;
+                        const full_f32_src: [f32_lanes]f32 = args.x.veks[i / 2];
+                        const half_f32_src: @Vector(f64_lanes, f32) = full_f32_src[jump_dist..][0..f64_lanes].*;
+                        const full_f64_out: @Vector(f64_lanes, f64) = @floatCast(half_f32_src);
+                        break :blk full_f64_out;
+                    },
+                    f64 => {
+                        const f32_vek_1: @Vector(f64_lanes, f32) = @floatCast(args.x.veks[i * 2]);
+                        const f32_vek_2: @Vector(f64_lanes, f32) = @floatCast(args.x.veks[i * 2 + 1]);
+                        var f32_vek_all: [f32_lanes]f32 = undefined;
+                        f32_vek_all[0..f64_lanes].* = f32_vek_1;
+                        f32_vek_all[f64_lanes..f32_lanes].* = f32_vek_2;
+                        break :blk f32_vek_all;
+                    },
+                    else => comptime unreachable,
+                }
+            },
         };
     }
 }
@@ -385,6 +419,26 @@ test "basic add" {
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
     try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
+}
+
+test "f32 -> f64 cast" {
+    const ctx = make(1024);
+
+    var a_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = to_stream(f32, ctx, &a_arr);
+
+    var b_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const b_stream = to_stream(f64, ctx, &b_arr);
+
+    const b_actual_stream = new_stream(f64, ctx, b_stream.len_scalars);
+    const args = Apply_Args_Single(f32, .FloatCast){
+        .x = a_stream,
+        .y = b_stream,
+    };
+    apply_single(f32, .FloatCast, args);
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    try testing.expectEqualSlices(f64, to_slice(f64, b_stream), to_slice(f64, b_actual_stream));
 }
 
 comptime {
