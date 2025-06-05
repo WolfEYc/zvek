@@ -75,9 +75,9 @@ fn print_float_slice(comptime T: type, s: []T) void {
     std.debug.print("\n", .{});
 }
 
-pub const TARGET_SIMD_BITS: comptime_int = 512; // AVX512
+pub const TARGET_SIMD_BYTES: comptime_int = 64; // AVX512
 pub fn lanes(comptime T: type) usize {
-    return TARGET_SIMD_BITS / 8 / @sizeOf(T);
+    return TARGET_SIMD_BYTES / @sizeOf(T);
 }
 
 pub fn Vek(comptime T: type) type {
@@ -201,15 +201,15 @@ pub inline fn apply(
             // .RShift => a_vek >> b_vek,
             // .SLShift => a_vek <<| b_vek,
             .And, .Or, .Xor => blk: {
-                const a_bits: @Vector(TARGET_SIMD_BITS, u1) = @bitCast(a_vek);
-                const b_bits: @Vector(TARGET_SIMD_BITS, u1) = @bitCast(b_vek);
-                const c_bits: @Vector(TARGET_SIMD_BITS, u1) = switch (op) {
-                    .And => a_bits & b_bits,
-                    .Or => a_bits | b_bits,
-                    .Xor => a_bits ^ b_bits,
+                const a_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(a_vek);
+                const b_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(b_vek);
+                const c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = switch (op) {
+                    .And => a_bytes & b_bytes,
+                    .Or => a_bytes | b_bytes,
+                    .Xor => a_bytes ^ b_bytes,
                     else => comptime unreachable,
                 };
-                const c_vek: Vek(T) = @bitCast(c_bits);
+                const c_vek: Vek(T) = @bitCast(c_bytes);
                 break :blk c_vek;
             },
         };
@@ -274,7 +274,7 @@ pub const Simd_Op1 = enum {
     Sqrt,
     Not,
     Neg,
-    // Abs,
+    Abs,
     Ln,
     Log2,
     Log10,
@@ -296,36 +296,62 @@ const simd_float_op_1s = [_]Simd_Op1{
 
 const signed_op_1s = [_]Simd_Op1{
     .Neg,
-    // .Abs,
+    .Abs,
 };
+
+fn unsigned_variant(comptime T: type) type {
+    return switch (T) {
+        i8 => u8,
+        i16 => u16,
+        i32 => u32,
+        i64 => u64,
+        f32 => f32,
+        f64 => f64,
+        else => comptime unreachable,
+    };
+}
+
+fn apply_type(comptime T: type, comptime Op: Simd_Op1) type {
+    return switch (Op) {
+        .Abs => unsigned_variant(T),
+        else => T,
+    };
+}
+
+fn Apply_Args_Single(comptime T: type, comptime Op: Simd_Op1) type {
+    return extern struct {
+        x: Stream(T),
+        y: Stream(apply_type(T, Op)),
+    };
+}
 
 pub inline fn apply_single(
     comptime T: type,
     comptime Op: Simd_Op1,
-    c: Stream(T),
+    args: Apply_Args_Single(T, Op),
 ) void {
-    for (0..c.len_veks) |i| {
-        c.veks[i] = switch (Op) {
-            .Ceil => @ceil(c.veks[i]),
-            .Floor => @floor(c.veks[i]),
-            .Round => @round(c.veks[i]),
-            .Sqrt => @sqrt(c.veks[i]),
+    for (0..args.y.len_veks) |i| {
+        args.y.veks[i] = switch (Op) {
+            .Ceil => @ceil(args.x.veks[i]),
+            .Floor => @floor(args.x.veks[i]),
+            .Round => @round(args.x.veks[i]),
+            .Sqrt => @sqrt(args.x.veks[i]),
             .Not => blk: {
-                var c_bits: @Vector(TARGET_SIMD_BITS, u1) = @bitCast(c.veks[i]);
-                c_bits = switch (Op) {
-                    .Not => ~c_bits,
+                var c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(args.x.veks[i]);
+                c_bytes = switch (Op) {
+                    .Not => ~c_bytes,
                     else => comptime unreachable,
                 };
-                const c_vek: Vek(T) = @bitCast(c_bits);
+                const c_vek: Vek(T) = @bitCast(c_bytes);
                 break :blk c_vek;
             },
-            .Neg => -c.veks[i],
-            // .Abs => @abs(c.veks[i]),
-            .Ln => @log(c.veks[i]),
-            .Log2 => @log2(c.veks[i]),
-            .Log10 => @log10(c.veks[i]),
-            .Exp => @exp(c.veks[i]),
-            .Exp2 => @exp2(c.veks[i]),
+            .Neg => -args.x.veks[i],
+            .Abs => @abs(args.x.veks[i]),
+            .Ln => @log(args.x.veks[i]),
+            .Log2 => @log2(args.x.veks[i]),
+            .Log10 => @log10(args.x.veks[i]),
+            .Exp => @exp(args.x.veks[i]),
+            .Exp2 => @exp2(args.x.veks[i]),
         };
     }
 }
@@ -464,8 +490,8 @@ fn generate_apply_single_func(
 ) void {
     const name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
     @export(&struct {
-        fn generated(stream: Stream(T)) callconv(.C) void {
-            apply_single(T, op, stream);
+        fn generated(args: *Apply_Args_Single(T, op)) callconv(.C) void {
+            apply_single(T, op, args.*);
         }
     }.generated, .{ .name = name });
 }

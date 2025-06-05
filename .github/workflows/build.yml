@@ -13,9 +13,9 @@ jobs:
           - target: aarch64-macos
             cpu: apple_m1
           - target: x86_64-linux
-            cpu: haswell # amd64 compatibility build
+            cpu: x86_64_v3 # x86_64 default build
           - target: x86_64-linux
-            cpu: znver4  # amd64 zen4 build
+            cpu: znver5 # AMD Zen 5
           - target: aarch64-linux
             cpu: neoverse_v2 # AWS Graviton4
     env:
