@@ -111,7 +111,7 @@ pub const Ctx = struct {
 var default_allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
 var gpa = default_allocator.allocator();
 
-pub export fn make(size: usize) *Ctx {
+pub export fn make_ctx(size: usize) *Ctx {
     const backing_mem = gpa.alloc(u8, size) catch unreachable;
     const fba = std.heap.FixedBufferAllocator.init(backing_mem);
     const ctx = gpa.create(Ctx) catch unreachable;
@@ -124,14 +124,14 @@ pub export fn make(size: usize) *Ctx {
     return ctx;
 }
 
-pub export fn free(ctx: *Ctx) void {
+pub export fn free_ctx(ctx: *Ctx) void {
     gpa.free(ctx.buffer);
     gpa.destroy(ctx);
 }
 
 pub fn to_stream(comptime T: type, ctx: *Ctx, slice: []T) Stream(T) {
-    var stream = new_stream(T, ctx, slice.len);
-    set_stream(T, &stream, slice);
+    const stream = new_stream(T, ctx, slice.len);
+    set_stream(T, stream, slice);
     return stream;
 }
 
@@ -144,10 +144,13 @@ pub fn new_stream(comptime T: type, ctx: *Ctx, len: usize) Stream(T) {
         .len_scalars = len,
     };
 }
-pub fn set_stream(comptime T: type, stream: *Stream(T), slice: []T) void {
+pub fn set_stream(comptime T: type, stream: Stream(T), slice: []T) void {
     assert(stream.len_scalars == slice.len);
     const stream_ptr: [*]T = @ptrCast(stream.veks);
     @memcpy(stream_ptr, slice);
+}
+pub fn free_stream(comptime T: type, ctx: *Ctx, stream: Stream(T)) void {
+    ctx.allocator.free(stream.veks);
 }
 
 pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
@@ -326,12 +329,91 @@ fn Apply_Args_Single(comptime T: type, comptime O: type) type {
     };
 }
 
-fn is_suported_cast(comptime T: type, comptime O: type) bool {}
+fn int_by_size(comptime signed: bool, size: comptime_int) type {
+    return switch (signed) {
+        true => switch (size) {
+            1 => i8,
+            2 => i16,
+            4 => i32,
+            8 => i64,
+            else => comptime @compileError(std.fmt.comptimePrint("signed {} byte integer no existy my friend", .{size})),
+        },
+        false => switch (size) {
+            1 => u8,
+            2 => u16,
+            4 => u32,
+            8 => u64,
+            else => comptime @compileError(std.fmt.comptimePrint("unsigned {} byte integer no existy my friend", .{size})),
+        },
+    };
+}
+fn vector_int_by_size(comptime signed: bool, len_child: comptime_int, size: comptime_int) type {
+    const scalar_t = int_by_size(signed, size);
+    return @Vector(len_child, scalar_t);
+}
 
-const supported_casts = [_][2]type{
-    [2]type{ u8, u16 },
-    [2]type{ u8, u32 },
-};
+pub fn cast(comptime T: type, comptime O: type, value: T) O {
+    comptime var in_type = @typeInfo(T);
+    comptime var out_type = @typeInfo(O);
+    const in_type_info = @typeInfo(T);
+
+    if (in_type == .vector and out_type == .vector) {
+        in_type = @typeInfo(in_type.vector.child);
+        out_type = @typeInfo(out_type.vector.child);
+    }
+    if (in_type == .optional) {
+        return cast(T, O, value.?);
+    }
+    return switch (out_type) {
+        .int => switch (in_type) {
+            .int => blk: {
+                if (out_type.int.bits <= in_type.int.bits) {
+                    const sign = in_type.int.signedness == .signed;
+                    const truncated_t = switch (in_type_info) {
+                        .vector => vector_int_by_size(sign, in_type_info.vector.len, @sizeOf(in_type_info.vector.child)),
+                        .int => int_by_size(sign, @sizeOf(T)),
+                        else => comptime unreachable,
+                    };
+                    const truncated: truncated_t = @truncate(value);
+                    break :blk @intCast(truncated);
+                }
+                break :blk @intCast(value);
+            },
+            .float => @intFromFloat(value),
+            .bool => @intFromBool(value),
+            .@"enum" => @intFromEnum(value),
+            .pointer => @intFromPtr(value),
+            else => invalid(T, O),
+        },
+        .float => switch (in_type) {
+            .int => @floatFromInt(value),
+            .float => @floatCast(value),
+            .bool => @floatFromInt(@intFromBool(value)),
+            else => invalid(T, O),
+        },
+        .bool => switch (in_type) {
+            .int => value != 0,
+            .float => value != 0,
+            .bool => value,
+            else => invalid(T, O),
+        },
+        .@"enum" => switch (in_type) {
+            .int => @enumFromInt(value),
+            .@"enum" => @enumFromInt(@intFromEnum(value)),
+            else => invalid(T, O),
+        },
+        .pointer => switch (in_type) {
+            .int => @ptrFromInt(value),
+            .pointer => @ptrCast(value),
+            else => invalid(T, O),
+        },
+        else => invalid(T, O),
+    };
+}
+
+pub fn invalid(comptime in: type, comptime out: type) noreturn {
+    @compileError("cast: " ++ @typeName(in) ++ " to " ++ @typeName(out) ++ " not supported");
+}
 
 pub inline fn apply_single(
     comptime T: type,
@@ -381,23 +463,23 @@ pub inline fn apply_single(
                 };
                 switch (cast_op) {
                     .EQ => {
-                        break :blk @as(O, args.x.veks[i]);
+                        break :blk cast(Vek(T), Vek(O), args.x.veks[i]);
                     },
                     .PROMOTION => {
                         const ratio = in_lanes / out_lanes;
                         const jump_dist = (i % ratio) * out_lanes;
                         const full_in_src: [in_lanes]T = args.x.veks[i / ratio];
                         const slice_in_src: @Vector(out_lanes, T) = full_in_src[jump_dist..][0..out_lanes].*;
-                        break :blk @as(@Vector(out_lanes, O), slice_in_src);
+                        break :blk cast(@Vector(out_lanes, T), @Vector(out_lanes, O), slice_in_src);
                     },
                     .DEMOTION => {
-                        // const ratio = out_lanes / in_lanes;
-                        const full_out_arr: [out_lanes]O = undefined;
-                        // inline for (0..ratio) |j| {
-                        //     // const out_jump = j * in_lanes;
-                        //     const in_idx = i * ratio + j;
-                        //     // full_out_arr[out_jump..][0..in_lanes].* = @as(@Vector(in_lanes, O), args.x.veks[in_idx]);
-                        // }
+                        const ratio = out_lanes / in_lanes;
+                        var full_out_arr: [out_lanes]O = undefined;
+                        inline for (0..ratio) |j| {
+                            const out_jump = j * in_lanes;
+                            const in_idx = i * ratio + j;
+                            full_out_arr[out_jump..][0..in_lanes].* = cast(@Vector(in_lanes, T), @Vector(in_lanes, O), args.x.veks[in_idx]);
+                        }
                         break :blk full_out_arr;
                     },
                 }
@@ -540,7 +622,7 @@ fn generate_apply_single_func(
 test "basic add" {
     const num_t = f64;
 
-    const ctx = make(1024);
+    const ctx = make_ctx(1024);
 
     var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
     const a_stream = to_stream(num_t, ctx, &a_arr);
@@ -563,39 +645,72 @@ test "basic add" {
     try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
 }
 
-test "f32 -> f64 cast" {
-    const ctx = make(1024);
-
-    var a_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(f32, ctx, &a_arr);
-
-    const b_actual_stream = new_stream(f64, ctx, a_stream.len_scalars);
-    const args = Apply_Args_Single(f32, f64){
-        .x = a_stream,
-        .y = b_actual_stream,
+fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
+    const t_info = @typeInfo(T);
+    const o_info = @typeInfo(O);
+    return switch (t_info) {
+        .int => blk: {
+            const max_val = switch (o_info) {
+                .int => @min(std.math.maxInt(T), std.math.maxInt(O)),
+                .float => std.math.maxInt(T),
+                else => comptime unreachable,
+            };
+            const min_val = switch (o_info) {
+                .int => switch (o_info.int.signedness) {
+                    .signed => @max(std.math.minInt(T), std.math.minInt(O)),
+                    .unsigned => 0,
+                },
+                .float => std.math.minInt(T),
+                else => comptime unreachable,
+            };
+            break :blk switch (t_info.int.signedness) {
+                .signed => r.intRangeLessThan(T, min_val, max_val),
+                .unsigned => r.uintLessThan(T, max_val),
+            };
+        },
+        .float => blk: {
+            const flert: T = @floatFromInt(r.intRangeLessThan(i32, std.math.minInt(i32), std.math.maxInt(i32)));
+            break :blk r.float(T) * flert;
+        },
+        else => comptime unreachable,
     };
-    apply_single(f32, f64, .Cast, args);
-    // print_vek(num_t, c_expect_stream);
-    // print_vek(num_t, c_actual_stream);
-    var b_expect_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const b_expect_stream = to_stream(f64, ctx, &b_expect_arr);
-    try testing.expectEqualSlices(f64, to_slice(f64, b_expect_stream), to_slice(f64, b_actual_stream));
 }
-test "f64 -> f32 cast" {
-    const ctx = make(1024);
 
-    var a_arr = [_]f64{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(f64, ctx, &a_arr);
+test "cast testing" {
+    @setEvalBranchQuota(4096);
+    var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var r = randy.random();
+    var allocator = std.testing.allocator;
+    inline for (number_types) |in| {
+        inline for (number_types) |out| {
+            if (in == out) {
+                continue;
+            }
+            const ctx = make_ctx(4096 * 8 * 3);
+            defer free_ctx(ctx);
+            const len = r.uintLessThan(usize, 4096);
 
-    const b_actual_stream = new_stream(f32, ctx, a_stream.len_scalars);
-    const args = Apply_Args_Single(f64, f32){
-        .x = a_stream,
-        .y = b_actual_stream,
-    };
-    apply_single(f64, f32, .Cast, args);
-    // print_vek(num_t, c_expect_stream);
-    // print_vek(num_t, c_actual_stream);
-    var b_expect_arr = [_]f32{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const b_expect_stream = to_stream(f32, ctx, &b_expect_arr);
-    try testing.expectEqualSlices(f32, to_slice(f32, b_expect_stream), to_slice(f32, b_actual_stream));
+            var a_arr = try allocator.alloc(in, len);
+            var b_expect_arr = try allocator.alloc(out, len);
+            defer allocator.free(a_arr);
+            defer allocator.free(b_expect_arr);
+            for (0..len) |i| {
+                const value = smart_random(in, out, r);
+                a_arr[i] = value;
+                b_expect_arr[i] = cast(in, out, value);
+            }
+            const a_stream = to_stream(in, ctx, a_arr);
+
+            const b_actual_stream = new_stream(out, ctx, a_stream.len_scalars);
+            const args = Apply_Args_Single(in, out){
+                .x = a_stream,
+                .y = b_actual_stream,
+            };
+            apply_single(in, out, .Cast, args);
+            // print_vek(num_t, c_expect_stream);
+            // print_vek(num_t, c_actual_stream);
+            const b_expect_stream = to_stream(out, ctx, b_expect_arr);
+            try testing.expectEqualSlices(out, to_slice(out, b_expect_stream), to_slice(out, b_actual_stream));
+        }
+    }
 }
