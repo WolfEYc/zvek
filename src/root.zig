@@ -138,6 +138,7 @@ pub fn to_stream(comptime T: type, ctx: *Ctx, slice: []T) Stream(T) {
 pub fn new_stream(comptime T: type, ctx: *Ctx, len: usize) Stream(T) {
     const num_veks = ceildiv(len, lanes(T));
     const stream: []Vek(T) = ctx.allocator.alloc(Vek(T), num_veks) catch @panic("OOM trying to create new stream");
+    @memset(stream, std.mem.zeroes(Vek(T)));
     return Stream(T){
         .veks = stream.ptr,
         .len_veks = num_veks,
@@ -355,7 +356,6 @@ fn vector_int_by_size(comptime signed: bool, len_child: comptime_int, size: comp
 pub fn cast(comptime T: type, comptime O: type, value: T) O {
     comptime var in_type = @typeInfo(T);
     comptime var out_type = @typeInfo(O);
-    const in_type_info = @typeInfo(T);
 
     if (in_type == .vector and out_type == .vector) {
         in_type = @typeInfo(in_type.vector.child);
@@ -366,19 +366,7 @@ pub fn cast(comptime T: type, comptime O: type, value: T) O {
     }
     return switch (out_type) {
         .int => switch (in_type) {
-            .int => blk: {
-                if (out_type.int.bits <= in_type.int.bits) {
-                    const sign = in_type.int.signedness == .signed;
-                    const truncated_t = switch (in_type_info) {
-                        .vector => vector_int_by_size(sign, in_type_info.vector.len, @sizeOf(in_type_info.vector.child)),
-                        .int => int_by_size(sign, @sizeOf(T)),
-                        else => comptime unreachable,
-                    };
-                    const truncated: truncated_t = @truncate(value);
-                    break :blk @intCast(truncated);
-                }
-                break :blk @intCast(value);
-            },
+            .int => @intCast(value),
             .float => @intFromFloat(value),
             .bool => @intFromBool(value),
             .@"enum" => @intFromEnum(value),
@@ -422,7 +410,9 @@ pub inline fn apply_single(
     args: Apply_Args_Single(T, O),
 ) void {
     assert(args.x.len_scalars == args.y.len_scalars);
-    for (0..args.y.len_veks) |i| {
+    const out_ubound = args.y.len_veks;
+    const in_ubound = args.x.len_veks;
+    for (0..out_ubound) |i| {
         args.y.veks[i] = switch (Op) {
             .Ceil => @ceil(args.x.veks[i]),
             .Floor => @floor(args.x.veks[i]),
@@ -474,11 +464,13 @@ pub inline fn apply_single(
                     },
                     .DEMOTION => {
                         const ratio = out_lanes / in_lanes;
+                        const in_jump = i * ratio;
                         var full_out_arr: [out_lanes]O = undefined;
                         inline for (0..ratio) |j| {
                             const out_jump = j * in_lanes;
-                            const in_idx = i * ratio + j;
-                            full_out_arr[out_jump..][0..in_lanes].* = cast(@Vector(in_lanes, T), @Vector(in_lanes, O), args.x.veks[in_idx]);
+                            const in_idx = in_jump + j;
+                            const out_vek = if (in_idx < in_ubound) cast(@Vector(in_lanes, T), @Vector(in_lanes, O), args.x.veks[in_idx]) else std.mem.zeroes(@Vector(in_lanes, O));
+                            full_out_arr[out_jump..][0..in_lanes].* = out_vek;
                         }
                         break :blk full_out_arr;
                     },
@@ -652,7 +644,7 @@ fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
         .int => blk: {
             const max_val = switch (o_info) {
                 .int => @min(std.math.maxInt(T), std.math.maxInt(O)),
-                .float => std.math.maxInt(T),
+                .float => @min(std.math.maxInt(T), std.math.maxInt(i32)),
                 else => comptime unreachable,
             };
             const min_val = switch (o_info) {
@@ -660,7 +652,7 @@ fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
                     .signed => @max(std.math.minInt(T), std.math.minInt(O)),
                     .unsigned => 0,
                 },
-                .float => std.math.minInt(T),
+                .float => @max(std.math.minInt(T), std.math.minInt(i32)),
                 else => comptime unreachable,
             };
             break :blk switch (t_info.int.signedness) {
@@ -669,7 +661,20 @@ fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
             };
         },
         .float => blk: {
-            const flert: T = @floatFromInt(r.intRangeLessThan(i32, std.math.minInt(i32), std.math.maxInt(i32)));
+            const max_val = switch (o_info) {
+                .int => @min(std.math.maxInt(O), std.math.maxInt(i32)),
+                .float => std.math.maxInt(i32),
+                else => comptime unreachable,
+            };
+            const min_val = switch (o_info) {
+                .int => switch (o_info.int.signedness) {
+                    .signed => @max(std.math.minInt(O), std.math.minInt(i32)),
+                    .unsigned => 0,
+                },
+                .float => std.math.minInt(i32),
+                else => comptime unreachable,
+            };
+            const flert: T = @floatFromInt(r.intRangeLessThan(i32, min_val, max_val));
             break :blk r.float(T) * flert;
         },
         else => comptime unreachable,
