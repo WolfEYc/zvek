@@ -35,6 +35,8 @@ const number_types = [_]type{
     i16,
     i32,
     i64,
+    i128,
+    u128,
     f32,
     f64,
 };
@@ -43,9 +45,7 @@ const float_types = [_]type{
     f32, f64,
 };
 
-const unsigned_types = [_]type{
-    u8, u16, u32, u64,
-};
+const unsigned_types = [_]type{ u8, u16, u32, u64, u128 };
 
 pub const Operand_Variant = enum {
     Vector,
@@ -118,6 +118,10 @@ pub export fn make_ctx(size: usize) *Ctx {
     };
     ctx.allocator = ctx.inner.allocator();
     return ctx;
+}
+
+pub export fn reset_ctx(ctx: *Ctx) void {
+    ctx.inner.reset();
 }
 
 pub export fn free_ctx(ctx: *Ctx) void {
@@ -326,6 +330,7 @@ fn unsigned_variant(comptime T: type) type {
         i16 => u16,
         i32 => u32,
         i64 => u64,
+        i128 => u128,
         f32 => f32,
         f64 => f64,
         else => comptime unreachable,
@@ -531,8 +536,17 @@ pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b
 }
 
 comptime {
+    const pots = [_]usize{ 1, 2, 4, 8, 16 };
+    for (pots) |pot| {
+        generate_new_fixed_stream_func(bool, TARGET_SIMD_BYTES / pot);
+    }
+
     @setEvalBranchQuota(4096);
     for (number_types) |t| {
+        generate_new_stream_func(t);
+        generate_set_stream_func(t);
+        generate_to_stream_func(t);
+
         var is_float_t = false;
         for (float_types) |float_ts| {
             if (t != float_ts) continue;
@@ -640,6 +654,39 @@ fn generate_select_func(
     @export(&struct {
         fn generated(args: *Select_Args(T, a_t, b_t)) callconv(.C) void {
             select(T, a_t, b_t, args.*);
+        }
+    }.generated, .{ .name = name });
+}
+
+fn generate_new_stream_func(comptime T: type) void {
+    const name: []const u8 = "New_" ++ @typeName(T) ++ "_Stream";
+    @export(&struct {
+        fn generated(ctx: *Ctx, len: usize) callconv(.C) Stream(T) {
+            return new_stream(T, ctx, len);
+        }
+    }.generated, .{ .name = name });
+}
+fn generate_set_stream_func(comptime T: type) void {
+    const name: []const u8 = "Set_" ++ @typeName(T) ++ "_Stream";
+    @export(&struct {
+        fn generated(stream: Stream(T), ptr: [*]T, len: usize) callconv(.C) void {
+            set_stream(T, stream, ptr[0..len]);
+        }
+    }.generated, .{ .name = name });
+}
+fn generate_to_stream_func(comptime T: type) void {
+    const name: []const u8 = "To_" ++ @typeName(T) ++ "_Stream";
+    @export(&struct {
+        fn generated(ctx: *Ctx, ptr: [*]T, len: usize) callconv(.C) Stream(T) {
+            return to_stream(T, ctx, ptr[0..len]);
+        }
+    }.generated, .{ .name = name });
+}
+fn generate_new_fixed_stream_func(comptime T: type, comptime lane_count: usize) void {
+    const name = std.fmt.comptimePrint("New_{}_Lane_{s}_Stream", .{ lane_count, @typeName(T) });
+    @export(&struct {
+        fn generated(ctx: *Ctx, len: usize) callconv(.C) Fixed_Stream(T, lane_count) {
+            return new_fixed_stream(T, lane_count, ctx, len);
         }
     }.generated, .{ .name = name });
 }
@@ -754,13 +801,13 @@ test "cast testing" {
     var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
     var r = randy.random();
     var allocator = std.testing.allocator;
+    const ctx = make_ctx(4096 * @sizeOf(i128) * 3);
     inline for (number_types) |in| {
         inline for (number_types) |out| {
             if (in == out) {
                 continue;
             }
-            const ctx = make_ctx(4096 * 8 * 3);
-            defer free_ctx(ctx);
+            defer reset_ctx(ctx);
             const len = r.uintLessThan(usize, 4096);
 
             var a_arr = try allocator.alloc(in, len);
