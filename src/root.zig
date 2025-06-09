@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -104,25 +105,19 @@ pub const Ctx = struct {
     allocator: Allocator,
     buffer: []u8,
 };
-var default_allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
-var gpa = default_allocator.allocator();
+pub const Debug_Ctx = struct {
+    inner: std.heap.FixedBufferAllocator,
+    allocator: Allocator,
+    buffer: []u8,
+    file_name: []const u8,
+    line_no: i32,
+};
+var default_allocator: std.heap.DebugAllocator(.{}) = .init;
+var gpa = if (builtin.is_test) std.testing.allocator else default_allocator.allocator();
 
 pub export fn make_ctx(size: usize) *Ctx {
-    const backing_mem = gpa.alloc(u8, size) catch unreachable;
     const ctx = gpa.create(Ctx) catch unreachable;
-    const fba = std.heap.FixedBufferAllocator.init(backing_mem);
-    ctx.* = Ctx{
-        .inner = fba,
-        .allocator = undefined,
-        .buffer = backing_mem,
-    };
-    ctx.allocator = ctx.inner.allocator();
-    return ctx;
-}
-
-fn make_test_ctx(size: usize) *Ctx {
-    const backing_mem = std.testing.allocator.alloc(u8, size) catch unreachable;
-    const ctx = std.testing.allocator.create(Ctx) catch unreachable;
+    const backing_mem = gpa.alloc(u8, size) catch unreachable;
     const fba = std.heap.FixedBufferAllocator.init(backing_mem);
     ctx.* = Ctx{
         .inner = fba,
@@ -140,11 +135,6 @@ pub export fn reset_ctx(ctx: *Ctx) void {
 pub export fn free_ctx(ctx: *Ctx) void {
     gpa.free(ctx.buffer);
     gpa.destroy(ctx);
-}
-
-fn free_test_ctx(ctx: *Ctx) void {
-    std.testing.allocator.free(ctx.buffer);
-    std.testing.allocator.destroy(ctx);
 }
 
 pub fn to_stream(comptime T: type, ctx: *Ctx, slice: []T) Stream(T) {
@@ -747,8 +737,8 @@ fn generate_apply_single_func(
 test "basic add" {
     const num_t = f64;
 
-    const ctx = make_test_ctx(1024);
-    defer free_test_ctx(ctx);
+    const ctx = make_ctx(1024);
+    defer free_ctx(ctx);
 
     var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
     const a_stream = to_stream(num_t, ctx, &a_arr);
@@ -820,8 +810,8 @@ test "cast testing" {
     var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
     var r = randy.random();
     var allocator = std.testing.allocator;
-    const ctx = make_test_ctx(4096 * @sizeOf(i128) * 3);
-    defer free_test_ctx(ctx);
+    const ctx = make_ctx(4096 * @sizeOf(i128) * 3);
+    defer free_ctx(ctx);
     inline for (number_types) |in| {
         inline for (number_types) |out| {
             if (in == out) {
@@ -857,8 +847,8 @@ test "cast testing" {
 test "apply bool + select" {
     const num_t = f64;
 
-    const ctx = make_test_ctx(1024);
-    defer free_test_ctx(ctx);
+    const ctx = make_ctx(1024);
+    defer free_ctx(ctx);
 
     var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
     const a_stream = to_stream(num_t, ctx, &a_arr);
