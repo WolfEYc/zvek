@@ -112,7 +112,7 @@ pub const Debug_Ctx = struct {
     file_name: []const u8,
     line_no: i32,
 };
-var default_allocator: std.heap.DebugAllocator(.{}) = .init;
+var default_allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
 var gpa = if (builtin.is_test) std.testing.allocator else default_allocator.allocator();
 
 pub export fn make_ctx(size: usize) *Ctx {
