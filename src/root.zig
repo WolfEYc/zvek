@@ -3,10 +3,6 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
-pub const Apply_Mode = enum {
-    Strict,
-    Grow,
-};
 pub const Simd_Op = enum {
     Add,
     Sub,
@@ -113,8 +109,8 @@ var gpa = default_allocator.allocator();
 
 pub export fn make_ctx(size: usize) *Ctx {
     const backing_mem = gpa.alloc(u8, size) catch unreachable;
-    const fba = std.heap.FixedBufferAllocator.init(backing_mem);
     const ctx = gpa.create(Ctx) catch unreachable;
+    const fba = std.heap.FixedBufferAllocator.init(backing_mem);
     ctx.* = Ctx{
         .inner = fba,
         .allocator = undefined,
@@ -145,13 +141,21 @@ pub fn new_stream(comptime T: type, ctx: *Ctx, len: usize) Stream(T) {
         .len_scalars = len,
     };
 }
+pub fn new_fixed_stream(comptime T: type, comptime lane_count: usize, ctx: *Ctx, len: usize) Fixed_Stream(T, lane_count) {
+    const num_veks = ceildiv(len, lane_count);
+    const vek_t = @Vector(lane_count, T);
+    const stream: []vek_t = ctx.allocator.alloc(vek_t, num_veks) catch @panic("OOM trying to create new stream");
+    @memset(stream, std.mem.zeroes(vek_t));
+    return Fixed_Stream(T, lane_count){
+        .veks = stream.ptr,
+        .len_veks = num_veks,
+        .len_scalars = len,
+    };
+}
 pub fn set_stream(comptime T: type, stream: Stream(T), slice: []T) void {
     assert(stream.len_scalars == slice.len);
     const stream_ptr: [*]T = @ptrCast(stream.veks);
     @memcpy(stream_ptr, slice);
-}
-pub fn free_stream(comptime T: type, ctx: *Ctx, stream: Stream(T)) void {
-    ctx.allocator.free(stream.veks);
 }
 
 pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
@@ -184,11 +188,16 @@ pub inline fn apply(
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    if (a_t == .Vector and b_t == .Vector) {
-        assert(args.a.len_scalars == args.b.len_scalars and args.b.len_scalars == args.c.len_scalars);
+    if (a_t == .Vector) {
+        assert(args.a.len_scalars == args.c.len_scalars);
     }
+    if (b_t == .Vector) {
+        assert(args.b.len_scalars == args.c.len_scalars);
+    }
+    const ubound = args.c.len_veks;
+    const cveks = args.c.veks;
 
-    for (0..args.c.len_veks) |i| {
+    for (0..ubound) |i| {
         const a_vek: Vek(T) = switch (a_t) {
             .Vector => args.a.veks[i],
             .Number => @splat(args.a),
@@ -197,7 +206,7 @@ pub inline fn apply(
             .Vector => args.b.veks[i],
             .Number => @splat(args.b),
         };
-        args.c.veks[i] = switch (op) {
+        cveks[i] = switch (op) {
             .Add => a_vek + b_vek,
             .Sub => a_vek - b_vek,
             .Div => a_vek / b_vek,
@@ -485,6 +494,42 @@ pub const SimdOp3 = enum {
     Fma,
 };
 
+fn Select_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
+    return extern struct {
+        a: Operand(T, a_t),
+        b: Operand(T, b_t),
+        pred: Fixed_Stream(bool, lanes(T)),
+        c: Stream(T),
+    };
+}
+
+pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b_t: Operand_Variant, args: Select_Args(T, a_t, b_t)) void {
+    if (a_t == .Number and b_t == .Number) {
+        @compileError("Adding scalars together should not be done in a vectorized operation bro");
+    }
+    if (a_t == .Vector) {
+        assert(args.a.len_scalars == args.c.len_scalars);
+    }
+    if (b_t == .Vector) {
+        assert(args.b.len_scalars == args.c.len_scalars);
+    }
+    const ubound = args.c.len_veks;
+    const cveks = args.c.veks;
+    const pred_veks = args.pred.veks;
+
+    for (0..ubound) |i| {
+        const a_vek: Vek(T) = switch (a_t) {
+            .Vector => args.a.veks[i],
+            .Number => @splat(args.a),
+        };
+        const b_vek: Vek(T) = switch (b_t) {
+            .Vector => args.b.veks[i],
+            .Number => @splat(args.b),
+        };
+        cveks[i] = @select(T, pred_veks[i], a_vek, b_vek);
+    }
+}
+
 comptime {
     @setEvalBranchQuota(4096);
     for (number_types) |t| {
@@ -514,6 +559,10 @@ comptime {
             generate_apply_func(t, op_enum, .Vector, .Number);
             generate_apply_func(t, op_enum, .Number, .Vector);
         }
+        // select
+        generate_select_func(t, .Vector, .Vector);
+        generate_select_func(t, .Number, .Vector);
+        generate_select_func(t, .Vector, .Number);
         // bool
         for (@typeInfo(Simd_Bool_Op).@"enum".fields) |op| {
             const op_enum: Simd_Bool_Op = @enumFromInt(op.value);
@@ -564,14 +613,33 @@ fn generate_apply_func(
 ) void {
     var name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
     if (a_t == .Number) {
-        name = "num_" ++ name;
+        name = "Num_" ++ name;
     }
     if (b_t == .Number) {
-        name = name ++ "_num";
+        name = name ++ "_Num";
     }
     @export(&struct {
         fn generated(args: *Apply_Args(T, a_t, b_t)) callconv(.C) void {
             apply(T, op, a_t, b_t, args.*);
+        }
+    }.generated, .{ .name = name });
+}
+
+fn generate_select_func(
+    comptime T: type,
+    comptime a_t: Operand_Variant,
+    comptime b_t: Operand_Variant,
+) void {
+    var name: []const u8 = "Select_" ++ @typeName(T);
+    if (a_t == .Number) {
+        name = "Num_" ++ name;
+    }
+    if (b_t == .Number) {
+        name = name ++ "_Num";
+    }
+    @export(&struct {
+        fn generated(args: *Select_Args(T, a_t, b_t)) callconv(.C) void {
+            select(T, a_t, b_t, args.*);
         }
     }.generated, .{ .name = name });
 }
@@ -584,10 +652,10 @@ fn generate_apply_bool_func(
 ) void {
     var name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
     if (a_t == .Number) {
-        name = "num_" ++ name;
+        name = "Num_" ++ name;
     }
     if (b_t == .Number) {
-        name = name ++ "_num";
+        name = name ++ "_Num";
     }
     @export(&struct {
         fn generated(args: *Apply_Bool_Args(T, a_t, b_t)) callconv(.C) void {
@@ -718,4 +786,34 @@ test "cast testing" {
             try testing.expectEqualSlices(out, to_slice(out, b_expect_stream), to_slice(out, b_actual_stream));
         }
     }
+}
+test "apply bool + select" {
+    const num_t = f64;
+
+    const ctx = make_ctx(1024);
+
+    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = to_stream(num_t, ctx, &a_arr);
+
+    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
+    const b_stream = to_stream(num_t, ctx, &b_arr);
+
+    const pred_stream = new_fixed_stream(bool, lanes(num_t), ctx, b_arr.len);
+    apply_bool(num_t, .Eq, .Vector, .Vector, Apply_Bool_Args(num_t, .Vector, .Vector){
+        .a = a_stream,
+        .b = b_stream,
+        .c = pred_stream,
+    });
+
+    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
+    select(num_t, .Vector, .Number, Select_Args(num_t, .Vector, .Number){
+        .a = a_stream,
+        .b = -1,
+        .pred = pred_stream,
+        .c = c_actual_stream,
+    });
+    // print_vek(num_t, c_expect_stream);
+    // print_vek(num_t, c_actual_stream);
+    var c_expect_arr = [_]num_t{ 0, 1, -1, -1, -1, -1, -1, 50, 100, 10, 20 };
+    try testing.expectEqualSlices(num_t, &c_expect_arr, to_slice(num_t, c_actual_stream));
 }
