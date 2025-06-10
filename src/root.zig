@@ -109,11 +109,11 @@ pub const Ctx = struct {
 const al: Allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
 var ctx_al: std.heap.MemoryPool(Ctx) = undefined;
 
-fn init() void {
+pub export fn init() void {
     ctx_al = std.heap.MemoryPool(Ctx).init(al);
 }
 
-fn deinit() void {
+pub export fn deinit() void {
     ctx_al.deinit();
 }
 
