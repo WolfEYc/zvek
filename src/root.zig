@@ -105,25 +105,22 @@ pub const Ctx = struct {
     allocator: Allocator,
     buffer: []u8,
 };
-var backing_mem: []u8 = undefined;
-var fba: std.heap.FixedBufferAllocator = undefined;
-var al: Allocator = if (builtin.is_test) std.testing.allocator else undefined;
-var ctx_al: std.heap.MemoryPool(Ctx) = if (builtin.is_test) std.heap.MemoryPool(Ctx).init(std.testing.allocator) else undefined;
 
-/// note that there is no corresponding "deinit" function as this mem is meant to have static lifetime
-/// at this lifetime, the OS is our garbage collector.
-pub export fn init(limit_bytes: usize) void {
-    const allocator = std.heap.page_allocator;
-    backing_mem = allocator.alignedAlloc(u8, .@"64", limit_bytes) catch unreachable;
-    fba = std.heap.FixedBufferAllocator.init(backing_mem);
+const al: Allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
+var ctx_al: std.heap.MemoryPool(Ctx) = undefined;
+
+fn init() void {
     ctx_al = std.heap.MemoryPool(Ctx).init(al);
-    al = std.heap.ThreadSafeAllocator.init(fba.allocator()); //TODO
+}
+
+fn deinit() void {
+    ctx_al.deinit();
 }
 
 pub export fn make_ctx(size: usize) *Ctx {
     const ctx = ctx_al.create() catch unreachable;
     const ctx_backing_mem = al.alloc(u8, size) catch unreachable;
-    const ctx_fba = std.heap.FixedBufferAllocator.init(backing_mem);
+    const ctx_fba = std.heap.FixedBufferAllocator.init(ctx_backing_mem);
     ctx.* = Ctx{
         .inner = ctx_fba,
         .allocator = undefined,
@@ -740,8 +737,11 @@ fn generate_apply_single_func(
 }
 
 test "basic add" {
+    init();
+    defer deinit();
     const num_t = f64;
 
+    // init();
     const ctx = make_ctx(1024);
     defer free_ctx(ctx);
 
@@ -811,6 +811,8 @@ fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
 }
 
 test "cast testing" {
+    init();
+    defer deinit();
     @setEvalBranchQuota(4096);
     var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
     var r = randy.random();
@@ -850,6 +852,8 @@ test "cast testing" {
     }
 }
 test "apply bool + select" {
+    init();
+    defer deinit();
     const num_t = f64;
 
     const ctx = make_ctx(1024);
