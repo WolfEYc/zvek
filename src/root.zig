@@ -105,24 +105,29 @@ pub const Ctx = struct {
     allocator: Allocator,
     buffer: []u8,
 };
-pub const Debug_Ctx = struct {
-    inner: std.heap.FixedBufferAllocator,
-    allocator: Allocator,
-    buffer: []u8,
-    file_name: []const u8,
-    line_no: i32,
-};
-var default_allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
-var gpa = if (builtin.is_test) std.testing.allocator else default_allocator.allocator();
+var backing_mem: []u8 = undefined;
+var fba: std.heap.FixedBufferAllocator = undefined;
+var al: Allocator = if (builtin.is_test) std.testing.allocator else undefined;
+var ctx_al: std.heap.MemoryPool(Ctx) = if (builtin.is_test) std.heap.MemoryPool(Ctx).init(std.testing.allocator) else undefined;
+
+/// note that there is no corresponding "deinit" function as this mem is meant to have static lifetime
+/// at this lifetime, the OS is our garbage collector.
+pub export fn init(limit_bytes: usize) void {
+    const allocator = std.heap.page_allocator;
+    backing_mem = allocator.alignedAlloc(u8, .@"64", limit_bytes) catch unreachable;
+    fba = std.heap.FixedBufferAllocator.init(backing_mem);
+    ctx_al = std.heap.MemoryPool(Ctx).init(al);
+    al = std.heap.ThreadSafeAllocator.init(fba.allocator()); //TODO
+}
 
 pub export fn make_ctx(size: usize) *Ctx {
-    const ctx = gpa.create(Ctx) catch unreachable;
-    const backing_mem = gpa.alloc(u8, size) catch unreachable;
-    const fba = std.heap.FixedBufferAllocator.init(backing_mem);
+    const ctx = ctx_al.create() catch unreachable;
+    const ctx_backing_mem = al.alloc(u8, size) catch unreachable;
+    const ctx_fba = std.heap.FixedBufferAllocator.init(backing_mem);
     ctx.* = Ctx{
-        .inner = fba,
+        .inner = ctx_fba,
         .allocator = undefined,
-        .buffer = backing_mem,
+        .buffer = ctx_backing_mem,
     };
     ctx.allocator = ctx.inner.allocator();
     return ctx;
@@ -133,8 +138,8 @@ pub export fn reset_ctx(ctx: *Ctx) void {
 }
 
 pub export fn free_ctx(ctx: *Ctx) void {
-    gpa.free(ctx.buffer);
-    gpa.destroy(ctx);
+    al.free(ctx.buffer);
+    ctx_al.destroy(ctx);
 }
 
 pub fn to_stream(comptime T: type, ctx: *Ctx, slice: []T) Stream(T) {
