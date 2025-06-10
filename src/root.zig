@@ -53,20 +53,6 @@ pub const Operand_Variant = enum {
     Number,
 };
 
-fn print_vek(comptime T: type, v: Stream(T)) void {
-    const stream_ptr: [*]T = @ptrCast(v.veks);
-    for (0..v.len_scalars) |i| {
-        std.debug.print("{d:.2} ", .{stream_ptr[i]});
-    }
-    std.debug.print("\n", .{});
-}
-fn print_vector(comptime T: type, comptime L: comptime_int, v: @Vector(L, T)) void {
-    for (0..L) |i| {
-        std.debug.print("{d:.2} ", .{v[i]});
-    }
-    std.debug.print("\n", .{});
-}
-
 fn ceildiv(x: usize, y: usize) usize {
     return x / y + @intFromBool(x % y != 0);
 }
@@ -85,20 +71,6 @@ pub fn lanes(comptime T: type) comptime_int {
 
 pub fn Vek(comptime T: type) type {
     return @Vector(lanes(T), T);
-}
-pub fn Stream(comptime T: type) type {
-    return extern struct {
-        veks: [*]Vek(T),
-        len_veks: usize,
-        len_scalars: usize,
-    };
-}
-pub fn Fixed_Stream(comptime T: type, comptime lane_count: usize) type {
-    return extern struct {
-        veks: [*]@Vector(lane_count, T),
-        len_veks: usize,
-        len_scalars: usize,
-    };
 }
 pub const Ctx = struct {
     inner: std.heap.FixedBufferAllocator,
@@ -139,56 +111,24 @@ pub export fn free_ctx(ctx: *Ctx) void {
     ctx_al.destroy(ctx);
 }
 
-pub fn to_stream(comptime T: type, ctx: *Ctx, slice: []T) Stream(T) {
-    const stream = new_stream(T, ctx, slice.len);
-    set_stream(T, stream, slice);
-    return stream;
-}
-
-pub fn new_stream(comptime T: type, ctx: *Ctx, len: usize) Stream(T) {
-    const num_veks = ceildiv(len, lanes(T));
-    const stream: []Vek(T) = ctx.allocator.alloc(Vek(T), num_veks) catch @panic("OOM trying to create new stream");
-    @memset(stream, std.mem.zeroes(Vek(T)));
-    return Stream(T){
-        .veks = stream.ptr,
-        .len_veks = num_veks,
-        .len_scalars = len,
-    };
-}
-pub fn new_fixed_stream(comptime T: type, comptime lane_count: usize, ctx: *Ctx, len: usize) Fixed_Stream(T, lane_count) {
-    const num_veks = ceildiv(len, lane_count);
-    const vek_t = @Vector(lane_count, T);
-    const stream: []vek_t = ctx.allocator.alloc(vek_t, num_veks) catch @panic("OOM trying to create new stream");
-    @memset(stream, std.mem.zeroes(vek_t));
-    return Fixed_Stream(T, lane_count){
-        .veks = stream.ptr,
-        .len_veks = num_veks,
-        .len_scalars = len,
-    };
-}
-pub fn set_stream(comptime T: type, stream: Stream(T), slice: []T) void {
-    assert(stream.len_scalars == slice.len);
-    const stream_ptr: [*]T = @ptrCast(stream.veks);
-    @memcpy(stream_ptr, slice);
+pub fn make_stream(comptime T: type, ctx: *Ctx, len: usize) []T {
+    const num_lanes = lanes(T);
+    const internal_size = ceildiv(len, num_lanes) * num_lanes;
+    return ctx.allocator.alignedAlloc(T, TARGET_SIMD_BYTES, internal_size) catch @panic("OOM trying to create new stream");
 }
 
 pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
     return switch (variant) {
-        .Vector => Stream(T),
+        .Vector => []T,
         .Number => T,
     };
 }
 
-fn to_slice(comptime T: type, s: Stream(T)) []T {
-    var slice: [*]T = @ptrCast(s.veks);
-    return slice[0..s.len_scalars];
-}
-
 fn Apply_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return extern struct {
+    return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        c: Stream(T),
+        c: []T,
     };
 }
 
@@ -202,25 +142,27 @@ pub inline fn apply(
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
+    const c_len = args.c.len;
     if (a_t == .Vector) {
-        assert(args.a.len_scalars == args.c.len_scalars);
+        assert(args.a.len == c_len);
     }
     if (b_t == .Vector) {
-        assert(args.b.len_scalars == args.c.len_scalars);
+        assert(args.b.len == c_len);
     }
-    const ubound = args.c.len_veks;
-    const cveks = args.c.veks;
+    const num_lanes = lanes(T);
 
-    for (0..ubound) |i| {
+    // streams are guarunteed to be 64 bytes min
+    var i: usize = 0;
+    while (i < c_len) : (i += num_lanes) {
         const a_vek: Vek(T) = switch (a_t) {
-            .Vector => args.a.veks[i],
+            .Vector => @alignCast(args.a[i..][0..num_lanes].*),
             .Number => @splat(args.a),
         };
         const b_vek: Vek(T) = switch (b_t) {
-            .Vector => args.b.veks[i],
+            .Vector => @alignCast(args.b.veks[i][0..num_lanes].*),
             .Number => @splat(args.b),
         };
-        cveks[i] = switch (op) {
+        args.c[i] = switch (op) {
             .Add => a_vek + b_vek,
             .Sub => a_vek - b_vek,
             .Div => a_vek / b_vek,
@@ -259,10 +201,10 @@ pub const Simd_Bool_Op = enum {
 };
 
 fn Apply_Bool_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return extern struct {
+    return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        c: Fixed_Stream(bool, lanes(T)),
+        c: []u1,
     };
 }
 
@@ -348,9 +290,9 @@ fn unsigned_variant(comptime T: type) type {
 }
 
 fn Apply_Args_Single(comptime T: type, comptime O: type) type {
-    return extern struct {
-        x: Stream(T),
-        y: Stream(O),
+    return struct {
+        x: []T,
+        y: []O,
     };
 }
 
@@ -513,8 +455,8 @@ fn Select_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Var
     return extern struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        pred: Fixed_Stream(bool, lanes(T)),
-        c: Stream(T),
+        pred: []u1,
+        c: []T,
     };
 }
 
@@ -546,16 +488,9 @@ pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b
 }
 
 comptime {
-    const pots = [_]usize{ 1, 2, 4, 8, 16 };
-    for (pots) |pot| {
-        generate_new_fixed_stream_func(bool, TARGET_SIMD_BYTES / pot);
-    }
-
     @setEvalBranchQuota(4096);
     for (number_types) |t| {
         generate_new_stream_func(t);
-        generate_set_stream_func(t);
-        generate_to_stream_func(t);
 
         var is_float_t = false;
         for (float_types) |float_ts| {
@@ -671,32 +606,8 @@ fn generate_select_func(
 fn generate_new_stream_func(comptime T: type) void {
     const name: []const u8 = "New_" ++ @typeName(T) ++ "_Stream";
     @export(&struct {
-        fn generated(ctx: *Ctx, len: usize) callconv(.C) Stream(T) {
-            return new_stream(T, ctx, len);
-        }
-    }.generated, .{ .name = name });
-}
-fn generate_set_stream_func(comptime T: type) void {
-    const name: []const u8 = "Set_" ++ @typeName(T) ++ "_Stream";
-    @export(&struct {
-        fn generated(stream: Stream(T), ptr: [*]T, len: usize) callconv(.C) void {
-            set_stream(T, stream, ptr[0..len]);
-        }
-    }.generated, .{ .name = name });
-}
-fn generate_to_stream_func(comptime T: type) void {
-    const name: []const u8 = "To_" ++ @typeName(T) ++ "_Stream";
-    @export(&struct {
-        fn generated(ctx: *Ctx, ptr: [*]T, len: usize) callconv(.C) Stream(T) {
-            return to_stream(T, ctx, ptr[0..len]);
-        }
-    }.generated, .{ .name = name });
-}
-fn generate_new_fixed_stream_func(comptime T: type, comptime lane_count: usize) void {
-    const name = std.fmt.comptimePrint("New_{}_Lane_{s}_Stream", .{ lane_count, @typeName(T) });
-    @export(&struct {
-        fn generated(ctx: *Ctx, len: usize) callconv(.C) Fixed_Stream(T, lane_count) {
-            return new_fixed_stream(T, lane_count, ctx, len);
+        fn generated(ctx: *Ctx, len: usize) callconv(.C) [*]T {
+            return make_stream(T, ctx, len).ptr;
         }
     }.generated, .{ .name = name });
 }
@@ -745,16 +656,19 @@ test "basic add" {
     const ctx = make_ctx(1024);
     defer free_ctx(ctx);
 
-    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(num_t, ctx, &a_arr);
+    const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = make_stream(num_t, ctx, a_arr.len);
+    @memcpy(a_stream, a_arr);
 
-    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const b_stream = to_stream(num_t, ctx, &b_arr);
+    const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
+    const b_stream = make_stream(num_t, ctx, b_arr.len);
+    @memcpy(b_stream, b_arr);
 
-    var c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
-    const c_expect_stream = to_stream(num_t, ctx, &c_expect_arr);
+    const c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
+    const c_expect_stream = make_stream(num_t, ctx, c_expect_arr.len);
+    @memcpy(c_expect_stream, c_expect_arr);
 
-    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
+    const c_actual_stream = make_stream(num_t, ctx, b_stream.len_scalars);
     const args = Apply_Args(num_t, .Vector, .Vector){
         .a = a_stream,
         .b = b_stream,
@@ -763,7 +677,7 @@ test "basic add" {
     apply(num_t, .Add, .Vector, .Vector, args);
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
-    try testing.expectEqualSlices(num_t, to_slice(num_t, c_expect_stream), to_slice(num_t, c_actual_stream));
+    try testing.expectEqualSlices(num_t, c_expect_stream, c_actual_stream);
 }
 
 fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
@@ -816,7 +730,6 @@ test "cast testing" {
     @setEvalBranchQuota(4096);
     var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
     var r = randy.random();
-    var allocator = std.testing.allocator;
     const ctx = make_ctx(4096 * @sizeOf(i128) * 3);
     defer free_ctx(ctx);
     inline for (number_types) |in| {
@@ -827,18 +740,15 @@ test "cast testing" {
             defer reset_ctx(ctx);
             const len = r.uintLessThan(usize, 4096);
 
-            var a_arr = try allocator.alloc(in, len);
-            var b_expect_arr = try allocator.alloc(out, len);
-            defer allocator.free(a_arr);
-            defer allocator.free(b_expect_arr);
+            var a_stream = make_stream(in, ctx, len);
+            var b_stream = make_stream(out, ctx, len);
             for (0..len) |i| {
                 const value = smart_random(in, out, r);
-                a_arr[i] = value;
-                b_expect_arr[i] = cast(in, out, value);
+                a_stream[i] = value;
+                b_stream[i] = cast(in, out, value);
             }
-            const a_stream = to_stream(in, ctx, a_arr);
 
-            const b_actual_stream = new_stream(out, ctx, a_stream.len_scalars);
+            const b_actual_stream = make_stream(out, ctx, a_stream.len_scalars);
             const args = Apply_Args_Single(in, out){
                 .x = a_stream,
                 .y = b_actual_stream,
@@ -846,8 +756,7 @@ test "cast testing" {
             apply_single(in, out, .Cast, args);
             // print_vek(num_t, c_expect_stream);
             // print_vek(num_t, c_actual_stream);
-            const b_expect_stream = to_stream(out, ctx, b_expect_arr);
-            try testing.expectEqualSlices(out, to_slice(out, b_expect_stream), to_slice(out, b_actual_stream));
+            try testing.expectEqualSlices(out, b_stream, b_actual_stream);
         }
     }
 }
@@ -859,20 +768,22 @@ test "apply bool + select" {
     const ctx = make_ctx(1024);
     defer free_ctx(ctx);
 
-    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = to_stream(num_t, ctx, &a_arr);
+    const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
+    const a_stream = make_stream(num_t, ctx, a_arr.len);
+    @memcpy(a_stream, a_arr);
 
-    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const b_stream = to_stream(num_t, ctx, &b_arr);
+    const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
+    const b_stream = make_stream(num_t, ctx, b_arr.len);
+    @memcpy(b_stream, b_arr);
 
-    const pred_stream = new_fixed_stream(bool, lanes(num_t), ctx, b_arr.len);
+    const pred_stream = make_stream(u1, ctx, b_arr.len);
     apply_bool(num_t, .Eq, .Vector, .Vector, Apply_Bool_Args(num_t, .Vector, .Vector){
         .a = a_stream,
         .b = b_stream,
         .c = pred_stream,
     });
 
-    const c_actual_stream = new_stream(num_t, ctx, b_stream.len_scalars);
+    const c_actual_stream = make_stream(num_t, ctx, b_stream.len_scalars);
     select(num_t, .Vector, .Number, Select_Args(num_t, .Vector, .Number){
         .a = a_stream,
         .b = -1,
@@ -882,5 +793,5 @@ test "apply bool + select" {
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
     var c_expect_arr = [_]num_t{ 0, 1, -1, -1, -1, -1, -1, 50, 100, 10, 20 };
-    try testing.expectEqualSlices(num_t, &c_expect_arr, to_slice(num_t, c_actual_stream));
+    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual_stream);
 }
