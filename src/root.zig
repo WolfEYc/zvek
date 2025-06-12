@@ -111,15 +111,17 @@ pub export fn free_ctx(ctx: *Ctx) void {
     ctx_al.destroy(ctx);
 }
 
-pub fn make_stream(comptime T: type, ctx: *Ctx, len: usize) []T {
+pub fn make_stream(comptime T: type, ctx: *Ctx, len: usize) [*]T {
     const num_lanes = lanes(T);
     const internal_size = ceildiv(len, num_lanes) * num_lanes;
-    return ctx.allocator.alignedAlloc(T, TARGET_SIMD_BYTES, internal_size) catch @panic("OOM trying to create new stream");
+    const stweam = ctx.allocator.alignedAlloc(T, .@"64", internal_size) catch @panic("OOM trying to create new stream");
+    @memset(stweam, 0);
+    return stweam.ptr;
 }
 
 pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
     return switch (variant) {
-        .Vector => []T,
+        .Vector => [*]T,
         .Number => T,
     };
 }
@@ -128,7 +130,8 @@ fn Apply_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Vari
     return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        c: []T,
+        c: [*]T,
+        len: usize,
     };
 }
 
@@ -142,27 +145,30 @@ pub inline fn apply(
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    const c_len = args.c.len;
-    if (a_t == .Vector) {
-        assert(args.a.len == c_len);
-    }
-    if (b_t == .Vector) {
-        assert(args.b.len == c_len);
-    }
     const num_lanes = lanes(T);
+    const a = args.a;
+    const b = args.b;
+    const c = args.c;
+    const len = args.len;
 
     // streams are guarunteed to be 64 bytes min
+
+    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
+    var a_vek_ptr: *Vek(T) = &a_vek;
+    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
+    var b_vek_ptr: *Vek(T) = &b_vek;
     var i: usize = 0;
-    while (i < c_len) : (i += num_lanes) {
-        const a_vek: Vek(T) = switch (a_t) {
-            .Vector => @alignCast(args.a[i..][0..num_lanes].*),
-            .Number => @splat(args.a),
-        };
-        const b_vek: Vek(T) = switch (b_t) {
-            .Vector => @alignCast(args.b.veks[i][0..num_lanes].*),
-            .Number => @splat(args.b),
-        };
-        args.c[i] = switch (op) {
+    while (i < len) : (i += num_lanes) {
+        if (a_t == .Vector) {
+            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
+            a_vek = a_vek_ptr.*;
+        }
+        if (b_t == .Vector) {
+            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
+            b_vek = b_vek_ptr.*;
+        }
+        const c_vek_ptr: *Vek(T) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
+        c_vek_ptr.* = switch (op) {
             .Add => a_vek + b_vek,
             .Sub => a_vek - b_vek,
             .Div => a_vek / b_vek,
@@ -204,13 +210,14 @@ fn Apply_Bool_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand
     return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        c: []u1,
+        c: [*]u1,
+        len: usize,
     };
 }
 
 pub inline fn apply_bool(
     comptime T: type,
-    comptime Op: Simd_Bool_Op,
+    comptime op: Simd_Bool_Op,
     comptime a_t: Operand_Variant,
     comptime b_t: Operand_Variant,
     args: Apply_Bool_Args(T, a_t, b_t),
@@ -218,20 +225,27 @@ pub inline fn apply_bool(
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    if (a_t == .Vector and b_t == .Vector) {
-        assert(args.a.len_scalars == args.b.len_scalars and args.b.len_scalars == args.c.len_scalars);
-    }
-
-    for (0..args.c.len_veks) |i| {
-        const a_vek: Vek(T) = switch (a_t) {
-            .Vector => args.a.veks[i],
-            .Number => @splat(args.a),
-        };
-        const b_vek: Vek(T) = switch (b_t) {
-            .Vector => args.b.veks[i],
-            .Number => @splat(args.b),
-        };
-        args.c.veks[i] = switch (Op) {
+    const a = args.a;
+    const b = args.b;
+    const c = args.c;
+    const len = args.len;
+    const num_lanes = lanes(T);
+    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
+    var a_vek_ptr: *Vek(T) = &a_vek;
+    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
+    var b_vek_ptr: *Vek(T) = &b_vek;
+    var i: usize = 0;
+    while (i < len) : (i += num_lanes) {
+        if (a_t == .Vector) {
+            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
+            a_vek = a_vek_ptr.*;
+        }
+        if (b_t == .Vector) {
+            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
+            b_vek = b_vek_ptr.*;
+        }
+        const c_vek_ptr: *@Vector(num_lanes, bool) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
+        c_vek_ptr.* = switch (op) {
             .Gt => a_vek > b_vek,
             .Gte => a_vek >= b_vek,
             .Lt => a_vek < b_vek,
@@ -291,8 +305,9 @@ fn unsigned_variant(comptime T: type) type {
 
 fn Apply_Args_Single(comptime T: type, comptime O: type) type {
     return struct {
-        x: []T,
-        y: []O,
+        x: [*]T,
+        y: [*]O,
+        len: usize,
     };
 }
 
@@ -375,73 +390,38 @@ pub inline fn apply_single(
     comptime Op: Simd_Op1,
     args: Apply_Args_Single(T, O),
 ) void {
-    assert(args.x.len_scalars == args.y.len_scalars);
-    const out_ubound = args.y.len_veks;
-    const in_ubound = args.x.len_veks;
-    for (0..out_ubound) |i| {
-        args.y.veks[i] = switch (Op) {
-            .Ceil => @ceil(args.x.veks[i]),
-            .Floor => @floor(args.x.veks[i]),
-            .Round => @round(args.x.veks[i]),
-            .Sqrt => @sqrt(args.x.veks[i]),
+    const x = args.x;
+    const y = args.y;
+    const len = args.len;
+    const num_lanes = @min(lanes(T), lanes(O));
+    const vek_t = @Vector(num_lanes, T);
+    const vek_o = @Vector(num_lanes, O);
+    var i: usize = 0;
+    while (i < len) : (i += num_lanes) {
+        const x_ptr: *vek_t = @ptrCast(@alignCast(x[i..][0..num_lanes]));
+        const y_ptr: *vek_o = @ptrCast(@alignCast(y[i..][0..num_lanes]));
+        y_ptr.* = switch (Op) {
+            .Ceil => @ceil(x_ptr.*),
+            .Floor => @floor(x_ptr.*),
+            .Round => @round(x_ptr.*),
+            .Sqrt => @sqrt(x_ptr.*),
             .Not => blk: {
-                var c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(args.x.veks[i]);
+                var c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(x_ptr.*);
                 c_bytes = switch (Op) {
                     .Not => ~c_bytes,
                     else => comptime unreachable,
                 };
-                const c_vek: Vek(T) = @bitCast(c_bytes);
+                const c_vek: vek_o = @bitCast(c_bytes);
                 break :blk c_vek;
             },
-            .Neg => -args.x.veks[i],
-            .Abs => @abs(args.x.veks[i]),
-            .Ln => @log(args.x.veks[i]),
-            .Log2 => @log2(args.x.veks[i]),
-            .Log10 => @log10(args.x.veks[i]),
-            .Exp => @exp(args.x.veks[i]),
-            .Exp2 => @exp2(args.x.veks[i]),
-            .Cast => blk: {
-                const Cast_Op = enum {
-                    EQ,
-                    PROMOTION,
-                    DEMOTION,
-                };
-                const in_lanes = lanes(T);
-                const out_lanes = lanes(O);
-                const cast_op: Cast_Op = op_blk: {
-                    if (in_lanes == out_lanes) {
-                        break :op_blk .EQ;
-                    }
-                    if (in_lanes > out_lanes) {
-                        break :op_blk .PROMOTION;
-                    }
-                    break :op_blk .DEMOTION;
-                };
-                switch (cast_op) {
-                    .EQ => {
-                        break :blk cast(Vek(T), Vek(O), args.x.veks[i]);
-                    },
-                    .PROMOTION => {
-                        const ratio = in_lanes / out_lanes;
-                        const jump_dist = (i % ratio) * out_lanes;
-                        const full_in_src: [in_lanes]T = args.x.veks[i / ratio];
-                        const slice_in_src: @Vector(out_lanes, T) = full_in_src[jump_dist..][0..out_lanes].*;
-                        break :blk cast(@Vector(out_lanes, T), @Vector(out_lanes, O), slice_in_src);
-                    },
-                    .DEMOTION => {
-                        const ratio = out_lanes / in_lanes;
-                        const in_jump = i * ratio;
-                        var full_out_arr: [out_lanes]O = undefined;
-                        inline for (0..ratio) |j| {
-                            const out_jump = j * in_lanes;
-                            const in_idx = in_jump + j;
-                            const out_vek = if (in_idx < in_ubound) cast(@Vector(in_lanes, T), @Vector(in_lanes, O), args.x.veks[in_idx]) else std.mem.zeroes(@Vector(in_lanes, O));
-                            full_out_arr[out_jump..][0..in_lanes].* = out_vek;
-                        }
-                        break :blk full_out_arr;
-                    },
-                }
-            },
+            .Neg => -x_ptr.*,
+            .Abs => @abs(x_ptr.*),
+            .Ln => @log(x_ptr.*),
+            .Log2 => @log2(x_ptr.*),
+            .Log10 => @log10(x_ptr.*),
+            .Exp => @exp(x_ptr.*),
+            .Exp2 => @exp2(x_ptr.*),
+            .Cast => cast(vek_t, vek_o, x_ptr.*),
         };
     }
 }
@@ -452,11 +432,12 @@ pub const SimdOp3 = enum {
 };
 
 fn Select_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return extern struct {
+    return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        pred: []u1,
-        c: []T,
+        pred: [*]u1,
+        c: [*]T,
+        len: usize,
     };
 }
 
@@ -464,26 +445,30 @@ pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b
     if (a_t == .Number and b_t == .Number) {
         @compileError("Adding scalars together should not be done in a vectorized operation bro");
     }
-    if (a_t == .Vector) {
-        assert(args.a.len_scalars == args.c.len_scalars);
-    }
-    if (b_t == .Vector) {
-        assert(args.b.len_scalars == args.c.len_scalars);
-    }
-    const ubound = args.c.len_veks;
-    const cveks = args.c.veks;
-    const pred_veks = args.pred.veks;
+    const a = args.a;
+    const b = args.b;
+    const c = args.c;
+    const len = args.len;
+    const pred = args.pred;
+    const num_lanes = lanes(T);
 
-    for (0..ubound) |i| {
-        const a_vek: Vek(T) = switch (a_t) {
-            .Vector => args.a.veks[i],
-            .Number => @splat(args.a),
-        };
-        const b_vek: Vek(T) = switch (b_t) {
-            .Vector => args.b.veks[i],
-            .Number => @splat(args.b),
-        };
-        cveks[i] = @select(T, pred_veks[i], a_vek, b_vek);
+    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
+    var a_vek_ptr: *Vek(T) = &a_vek;
+    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
+    var b_vek_ptr: *Vek(T) = &b_vek;
+    var i: usize = 0;
+    while (i < len) : (i += num_lanes) {
+        if (a_t == .Vector) {
+            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
+            a_vek = a_vek_ptr.*;
+        }
+        if (b_t == .Vector) {
+            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
+            b_vek = b_vek_ptr.*;
+        }
+        const c_vek_ptr: *Vek(T) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
+        const pred_vek: *@Vector(num_lanes, bool) = @ptrCast(@alignCast(pred[i..][0..num_lanes]));
+        c_vek_ptr.* = @select(T, pred_vek.*, a_vek, b_vek);
     }
 }
 
@@ -607,7 +592,7 @@ fn generate_new_stream_func(comptime T: type) void {
     const name: []const u8 = "New_" ++ @typeName(T) ++ "_Stream";
     @export(&struct {
         fn generated(ctx: *Ctx, len: usize) callconv(.C) [*]T {
-            return make_stream(T, ctx, len).ptr;
+            return make_stream(T, ctx, len);
         }
     }.generated, .{ .name = name });
 }
@@ -658,26 +643,27 @@ test "basic add" {
 
     const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
     const a_stream = make_stream(num_t, ctx, a_arr.len);
-    @memcpy(a_stream, a_arr);
+    @memcpy(a_stream, &a_arr);
 
     const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
     const b_stream = make_stream(num_t, ctx, b_arr.len);
-    @memcpy(b_stream, b_arr);
+    @memcpy(b_stream, &b_arr);
 
     const c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
     const c_expect_stream = make_stream(num_t, ctx, c_expect_arr.len);
-    @memcpy(c_expect_stream, c_expect_arr);
+    @memcpy(c_expect_stream, &c_expect_arr);
 
-    const c_actual_stream = make_stream(num_t, ctx, b_stream.len_scalars);
+    const c_actual_stream = make_stream(num_t, ctx, b_arr.len);
     const args = Apply_Args(num_t, .Vector, .Vector){
         .a = a_stream,
         .b = b_stream,
         .c = c_actual_stream,
+        .len = a_arr.len,
     };
     apply(num_t, .Add, .Vector, .Vector, args);
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
-    try testing.expectEqualSlices(num_t, c_expect_stream, c_actual_stream);
+    try testing.expectEqualSlices(num_t, c_expect_stream[0..c_expect_arr.len], c_actual_stream[0..b_arr.len]);
 }
 
 fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
@@ -748,15 +734,16 @@ test "cast testing" {
                 b_stream[i] = cast(in, out, value);
             }
 
-            const b_actual_stream = make_stream(out, ctx, a_stream.len_scalars);
+            const b_actual_stream = make_stream(out, ctx, len);
             const args = Apply_Args_Single(in, out){
                 .x = a_stream,
                 .y = b_actual_stream,
+                .len = len,
             };
             apply_single(in, out, .Cast, args);
             // print_vek(num_t, c_expect_stream);
             // print_vek(num_t, c_actual_stream);
-            try testing.expectEqualSlices(out, b_stream, b_actual_stream);
+            try testing.expectEqualSlices(out, b_stream[0..len], b_actual_stream[0..len]);
         }
     }
 }
@@ -770,28 +757,30 @@ test "apply bool + select" {
 
     const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
     const a_stream = make_stream(num_t, ctx, a_arr.len);
-    @memcpy(a_stream, a_arr);
+    @memcpy(a_stream, &a_arr);
 
     const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
     const b_stream = make_stream(num_t, ctx, b_arr.len);
-    @memcpy(b_stream, b_arr);
+    @memcpy(b_stream, &b_arr);
 
     const pred_stream = make_stream(u1, ctx, b_arr.len);
     apply_bool(num_t, .Eq, .Vector, .Vector, Apply_Bool_Args(num_t, .Vector, .Vector){
         .a = a_stream,
         .b = b_stream,
         .c = pred_stream,
+        .len = a_arr.len,
     });
 
-    const c_actual_stream = make_stream(num_t, ctx, b_stream.len_scalars);
+    const c_actual_stream = make_stream(num_t, ctx, b_arr.len);
     select(num_t, .Vector, .Number, Select_Args(num_t, .Vector, .Number){
         .a = a_stream,
         .b = -1,
         .pred = pred_stream,
         .c = c_actual_stream,
+        .len = b_arr.len,
     });
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
     var c_expect_arr = [_]num_t{ 0, 1, -1, -1, -1, -1, -1, 50, 100, 10, 20 };
-    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual_stream);
+    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual_stream[0..a_arr.len]);
 }
