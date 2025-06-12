@@ -114,7 +114,7 @@ pub export fn free_ctx(ctx: *Ctx) void {
 pub fn make_stream(comptime T: type, ctx: *Ctx, len: usize) [*]T {
     const num_lanes = lanes(T);
     const internal_size = ceildiv(len, num_lanes) * num_lanes;
-    const stweam = ctx.allocator.alignedAlloc(T, .@"64", internal_size) catch @panic("OOM trying to create new stream");
+    const stweam = ctx.allocator.alignedAlloc(T, TARGET_SIMD_BYTES, internal_size) catch @panic("OOM trying to create new stream");
     @memset(stweam, 0);
     return stweam.ptr;
 }
