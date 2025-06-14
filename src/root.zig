@@ -27,6 +27,12 @@ const simd_float_ops = [_]Simd_Op{
     .Pow,
 };
 
+const simd_byte_ops = [_]Simd_Op{
+    .And,
+    .Or,
+    .Xor,
+};
+
 const number_types = [_]type{
     u8,
     u16,
@@ -181,18 +187,9 @@ pub inline fn apply(
             // .LShift => a_vek << b_vek,
             // .RShift => a_vek >> b_vek,
             // .SLShift => a_vek <<| b_vek,
-            .And, .Or, .Xor => blk: {
-                const a_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(a_vek);
-                const b_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(b_vek);
-                const c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = switch (op) {
-                    .And => a_bytes & b_bytes,
-                    .Or => a_bytes | b_bytes,
-                    .Xor => a_bytes ^ b_bytes,
-                    else => comptime unreachable,
-                };
-                const c_vek: Vek(T) = @bitCast(c_bytes);
-                break :blk c_vek;
-            },
+            .And => a_vek & b_vek,
+            .Or => a_vek | b_vek,
+            .Xor => a_vek ^ b_vek,
         };
     }
 }
@@ -495,6 +492,13 @@ comptime {
             if (!is_float_t) {
                 for (simd_float_ops) |float_op| {
                     if (op_enum == float_op) {
+                        continue :normal_loop;
+                    }
+                }
+            }
+            if (t != u8) {
+                for (simd_byte_ops) |byte_op| {
+                    if (op_enum == byte_op) {
                         continue :normal_loop;
                     }
                 }
