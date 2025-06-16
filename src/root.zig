@@ -78,52 +78,6 @@ pub fn lanes(comptime T: type) comptime_int {
 pub fn Vek(comptime T: type) type {
     return @Vector(lanes(T), T);
 }
-pub const Ctx = struct {
-    inner: std.heap.FixedBufferAllocator,
-    allocator: Allocator,
-    buffer: []u8,
-};
-
-const al: Allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
-var ctx_al: std.heap.MemoryPool(Ctx) = undefined;
-
-pub export fn init() void {
-    ctx_al = std.heap.MemoryPool(Ctx).init(al);
-}
-
-pub export fn deinit() void {
-    ctx_al.deinit();
-}
-
-pub export fn make_ctx(size: usize) *Ctx {
-    const ctx = ctx_al.create() catch unreachable;
-    const ctx_backing_mem = al.alloc(u8, size) catch unreachable;
-    const ctx_fba = std.heap.FixedBufferAllocator.init(ctx_backing_mem);
-    ctx.* = Ctx{
-        .inner = ctx_fba,
-        .allocator = undefined,
-        .buffer = ctx_backing_mem,
-    };
-    ctx.allocator = ctx.inner.allocator();
-    return ctx;
-}
-
-pub export fn reset_ctx(ctx: *Ctx) void {
-    ctx.inner.reset();
-}
-
-pub export fn free_ctx(ctx: *Ctx) void {
-    al.free(ctx.buffer);
-    ctx_al.destroy(ctx);
-}
-
-pub fn make_stream(comptime T: type, ctx: *Ctx, len: usize) [*]T {
-    const num_lanes = lanes(T);
-    const internal_size = ceildiv(len, num_lanes) * num_lanes;
-    const stweam = ctx.allocator.alignedAlloc(T, TARGET_SIMD_BYTES, internal_size) catch @panic("OOM trying to create new stream");
-    @memset(stweam, 0);
-    return stweam.ptr;
-}
 
 pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
     return switch (variant) {
@@ -133,7 +87,7 @@ pub fn Operand(comptime T: type, comptime variant: Operand_Variant) type {
 }
 
 fn Apply_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return struct {
+    return extern struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
         c: [*]T,
@@ -156,25 +110,19 @@ pub inline fn apply(
     const b = args.b;
     const c = args.c;
     const len = args.len;
+    const simd_len = (len / num_lanes) * num_lanes;
 
-    // streams are guarunteed to be 64 bytes min
-
-    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
-    var a_vek_ptr: *Vek(T) = &a_vek;
-    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
-    var b_vek_ptr: *Vek(T) = &b_vek;
     var i: usize = 0;
-    while (i < len) : (i += num_lanes) {
-        if (a_t == .Vector) {
-            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
-            a_vek = a_vek_ptr.*;
-        }
-        if (b_t == .Vector) {
-            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
-            b_vek = b_vek_ptr.*;
-        }
-        const c_vek_ptr: *Vek(T) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
-        c_vek_ptr.* = switch (op) {
+    while (i < simd_len) : (i += num_lanes) {
+        const a_vek: Vek(T) = switch (a_t) {
+            .Number => @splat(a),
+            .Vector => a[i..][0..num_lanes].*,
+        };
+        const b_vek: Vek(T) = switch (b_t) {
+            .Number => @splat(b),
+            .Vector => b[i..][0..num_lanes].*,
+        };
+        c[i..][0..num_lanes].* = switch (op) {
             .Add => a_vek + b_vek,
             .Sub => a_vek - b_vek,
             .Div => a_vek / b_vek,
@@ -192,6 +140,34 @@ pub inline fn apply(
             .Xor => a_vek ^ b_vek,
         };
     }
+    //leftovers
+    while (i < len) : (i += 1) {
+        const a_num: T = switch (a_t) {
+            .Number => a,
+            .Vector => a[i],
+        };
+        const b_num: T = switch (b_t) {
+            .Number => b,
+            .Vector => b[i],
+        };
+        c[i] = switch (op) {
+            .Add => a_num + b_num,
+            .Sub => a_num - b_num,
+            .Div => @divTrunc(a_num, b_num),
+            .Mul => a_num * b_num,
+            .Mod => @mod(a_num, b_num),
+            .Min => @min(a_num, b_num),
+            .Max => @max(a_num, b_num),
+            .Log => @log2(b_num) / @log2(a_num),
+            .Pow => @exp2(b_num * @log2(a_num)),
+            // .LShift => a_num << b_num,
+            // .RShift => a_num >> b_num,
+            // .SLShift => a_num <<| b_num,
+            .And => a_num & b_num,
+            .Or => a_num | b_num,
+            .Xor => a_num ^ b_num,
+        };
+    }
 }
 
 pub const Simd_Bool_Op = enum {
@@ -207,7 +183,7 @@ fn Apply_Bool_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand
     return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        c: [*]u1,
+        c: [*]bool,
         len: usize,
     };
 }
@@ -227,28 +203,44 @@ pub inline fn apply_bool(
     const c = args.c;
     const len = args.len;
     const num_lanes = lanes(T);
-    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
-    var a_vek_ptr: *Vek(T) = &a_vek;
-    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
-    var b_vek_ptr: *Vek(T) = &b_vek;
+    const simd_len = (len / num_lanes) * num_lanes;
+
     var i: usize = 0;
-    while (i < len) : (i += num_lanes) {
-        if (a_t == .Vector) {
-            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
-            a_vek = a_vek_ptr.*;
-        }
-        if (b_t == .Vector) {
-            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
-            b_vek = b_vek_ptr.*;
-        }
-        const c_vek_ptr: *@Vector(num_lanes, bool) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
-        c_vek_ptr.* = switch (op) {
+    while (i < simd_len) : (i += num_lanes) {
+        const a_vek: Vek(T) = switch (a_t) {
+            .Number => @splat(a),
+            .Vector => a[i..][0..num_lanes].*,
+        };
+        const b_vek: Vek(T) = switch (b_t) {
+            .Number => @splat(b),
+            .Vector => b[i..][0..num_lanes].*,
+        };
+        c[i..][0..num_lanes].* = switch (op) {
             .Gt => a_vek > b_vek,
             .Gte => a_vek >= b_vek,
             .Lt => a_vek < b_vek,
             .Lte => a_vek <= b_vek,
             .Eq => a_vek == b_vek,
             .Neq => a_vek != b_vek,
+        };
+    }
+    // leftovers
+    while (i < len) : (i += 1) {
+        const a_num: T = switch (a_t) {
+            .Number => a,
+            .Vector => a[i],
+        };
+        const b_num: T = switch (b_t) {
+            .Number => b,
+            .Vector => b[i],
+        };
+        c[i] = switch (op) {
+            .Gt => a_num > b_num,
+            .Gte => a_num >= b_num,
+            .Lt => a_num < b_num,
+            .Lte => a_num <= b_num,
+            .Eq => a_num == b_num,
+            .Neq => a_num != b_num,
         };
     }
 }
@@ -279,13 +271,14 @@ const simd_float_op_1s = [_]Simd_Op1{
     .Ceil,
     .Floor,
     .Round,
-    .Cast,
 };
 
 const signed_op_1s = [_]Simd_Op1{
     .Neg,
     .Abs,
 };
+
+const byte_op_1s = [_]Simd_Op1{.Not};
 
 fn unsigned_variant(comptime T: type) type {
     return switch (T) {
@@ -391,34 +384,44 @@ pub inline fn apply_single(
     const y = args.y;
     const len = args.len;
     const num_lanes = @min(lanes(T), lanes(O));
+    const simd_len = (len / num_lanes) * num_lanes;
     const vek_t = @Vector(num_lanes, T);
     const vek_o = @Vector(num_lanes, O);
     var i: usize = 0;
-    while (i < len) : (i += num_lanes) {
-        const x_ptr: *vek_t = @ptrCast(@alignCast(x[i..][0..num_lanes]));
-        const y_ptr: *vek_o = @ptrCast(@alignCast(y[i..][0..num_lanes]));
-        y_ptr.* = switch (Op) {
-            .Ceil => @ceil(x_ptr.*),
-            .Floor => @floor(x_ptr.*),
-            .Round => @round(x_ptr.*),
-            .Sqrt => @sqrt(x_ptr.*),
-            .Not => blk: {
-                var c_bytes: @Vector(TARGET_SIMD_BYTES, u8) = @bitCast(x_ptr.*);
-                c_bytes = switch (Op) {
-                    .Not => ~c_bytes,
-                    else => comptime unreachable,
-                };
-                const c_vek: vek_o = @bitCast(c_bytes);
-                break :blk c_vek;
-            },
-            .Neg => -x_ptr.*,
-            .Abs => @abs(x_ptr.*),
-            .Ln => @log(x_ptr.*),
-            .Log2 => @log2(x_ptr.*),
-            .Log10 => @log10(x_ptr.*),
-            .Exp => @exp(x_ptr.*),
-            .Exp2 => @exp2(x_ptr.*),
-            .Cast => cast(vek_t, vek_o, x_ptr.*),
+    while (i < simd_len) : (i += num_lanes) {
+        const x_vek: vek_t = x[i..][0..num_lanes].*;
+        y[i..][0..num_lanes].* = switch (Op) {
+            .Ceil => @ceil(x_vek),
+            .Floor => @floor(x_vek),
+            .Round => @round(x_vek),
+            .Sqrt => @sqrt(x_vek),
+            .Not => ~x_vek,
+            .Neg => -x_vek,
+            .Abs => @abs(x_vek),
+            .Ln => @log(x_vek),
+            .Log2 => @log2(x_vek),
+            .Log10 => @log10(x_vek),
+            .Exp => @exp(x_vek),
+            .Exp2 => @exp2(x_vek),
+            .Cast => cast(vek_t, vek_o, x_vek),
+        };
+    }
+    // leftovers
+    while (i < len) : (i += 1) {
+        y[i] = switch (Op) {
+            .Ceil => @ceil(x[i]),
+            .Floor => @floor(x[i]),
+            .Round => @round(x[i]),
+            .Sqrt => @sqrt(x[i]),
+            .Not => ~x[i],
+            .Neg => -x[i],
+            .Abs => @abs(x[i]),
+            .Ln => @log(x[i]),
+            .Log2 => @log2(x[i]),
+            .Log10 => @log10(x[i]),
+            .Exp => @exp(x[i]),
+            .Exp2 => @exp2(x[i]),
+            .Cast => cast(T, O, x[i]),
         };
     }
 }
@@ -432,7 +435,7 @@ fn Select_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Var
     return struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
-        pred: [*]u1,
+        pred: [*]bool,
         c: [*]T,
         len: usize,
     };
@@ -448,32 +451,38 @@ pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b
     const len = args.len;
     const pred = args.pred;
     const num_lanes = lanes(T);
+    const simd_len = (len / num_lanes) * num_lanes;
 
-    var a_vek: Vek(T) = if (a_t == .Number) @splat(a) else undefined;
-    var a_vek_ptr: *Vek(T) = &a_vek;
-    var b_vek: Vek(T) = if (b_t == .Number) @splat(b) else undefined;
-    var b_vek_ptr: *Vek(T) = &b_vek;
     var i: usize = 0;
-    while (i < len) : (i += num_lanes) {
-        if (a_t == .Vector) {
-            a_vek_ptr = @ptrCast(@alignCast(a[i..][0..num_lanes]));
-            a_vek = a_vek_ptr.*;
-        }
-        if (b_t == .Vector) {
-            b_vek_ptr = @ptrCast(@alignCast(b[i..][0..num_lanes]));
-            b_vek = b_vek_ptr.*;
-        }
-        const c_vek_ptr: *Vek(T) = @ptrCast(@alignCast(c[i..][0..num_lanes]));
-        const pred_vek: *@Vector(num_lanes, bool) = @ptrCast(@alignCast(pred[i..][0..num_lanes]));
-        c_vek_ptr.* = @select(T, pred_vek.*, a_vek, b_vek);
+    while (i < simd_len) : (i += num_lanes) {
+        const a_vek: Vek(T) = switch (a_t) {
+            .Number => @splat(a),
+            .Vector => a[i..][0..num_lanes].*,
+        };
+        const b_vek: Vek(T) = switch (b_t) {
+            .Number => @splat(b),
+            .Vector => b[i..][0..num_lanes].*,
+        };
+        const pred_vek: @Vector(num_lanes, bool) = pred[i..][0..num_lanes].*;
+        c[i..][0..num_lanes].* = @select(T, pred_vek, a_vek, b_vek);
+    }
+    // leftovers
+    while (i < len) : (i += 1) {
+        const a_num: T = switch (a_t) {
+            .Number => a,
+            .Vector => a[i],
+        };
+        const b_num: T = switch (b_t) {
+            .Number => b,
+            .Vector => b[i],
+        };
+        c[i] = if (pred[i]) a_num else b_num;
     }
 }
 
 comptime {
     @setEvalBranchQuota(4096);
     for (number_types) |t| {
-        generate_new_stream_func(t);
-
         var is_float_t = false;
         for (float_types) |float_ts| {
             if (t != float_ts) continue;
@@ -538,6 +547,13 @@ comptime {
                     }
                 }
             }
+            if (t != u8) {
+                for (byte_op_1s) |byte_op| {
+                    if (op_enum == byte_op) {
+                        continue :single_loop;
+                    }
+                }
+            }
             const out_t = switch (op_enum) {
                 .Abs => unsigned_variant(t),
                 else => t,
@@ -592,15 +608,6 @@ fn generate_select_func(
     }.generated, .{ .name = name });
 }
 
-fn generate_new_stream_func(comptime T: type) void {
-    const name: []const u8 = "New_" ++ @typeName(T) ++ "_Stream";
-    @export(&struct {
-        fn generated(ctx: *Ctx, len: usize) callconv(.C) [*]T {
-            return make_stream(T, ctx, len);
-        }
-    }.generated, .{ .name = name });
-}
-
 fn generate_apply_bool_func(
     comptime T: type,
     comptime op: Simd_Bool_Op,
@@ -637,37 +644,29 @@ fn generate_apply_single_func(
 }
 
 test "basic add" {
-    init();
-    defer deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.reset(.free_all);
+    const al = arena.allocator();
     const num_t = f64;
 
     // init();
-    const ctx = make_ctx(1024);
-    defer free_ctx(ctx);
 
-    const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = make_stream(num_t, ctx, a_arr.len);
-    @memcpy(a_stream, &a_arr);
+    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
 
-    const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const b_stream = make_stream(num_t, ctx, b_arr.len);
-    @memcpy(b_stream, &b_arr);
+    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
 
-    const c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
-    const c_expect_stream = make_stream(num_t, ctx, c_expect_arr.len);
-    @memcpy(c_expect_stream, &c_expect_arr);
-
-    const c_actual_stream = make_stream(num_t, ctx, b_arr.len);
+    const c_actual = try al.alloc(num_t, b_arr.len);
     const args = Apply_Args(num_t, .Vector, .Vector){
-        .a = a_stream,
-        .b = b_stream,
-        .c = c_actual_stream,
+        .a = &a_arr,
+        .b = &b_arr,
+        .c = c_actual.ptr,
         .len = a_arr.len,
     };
     apply(num_t, .Add, .Vector, .Vector, args);
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
-    try testing.expectEqualSlices(num_t, c_expect_stream[0..c_expect_arr.len], c_actual_stream[0..b_arr.len]);
+    const c_expect_arr = [_]num_t{ 0, 2, 10, 165, 1000, 1110, 16665, 100, 200, 20, 40 };
+    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual);
 }
 
 fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
@@ -715,76 +714,70 @@ fn smart_random(comptime T: type, comptime O: type, r: std.Random) T {
 }
 
 test "cast testing" {
-    init();
-    defer deinit();
     @setEvalBranchQuota(4096);
     var randy = std.Random.DefaultPrng.init(std.testing.random_seed);
     var r = randy.random();
-    const ctx = make_ctx(4096 * @sizeOf(i128) * 3);
-    defer free_ctx(ctx);
+    const buf = try std.testing.allocator.alloc(u8, 4096 * 3 * 16);
+    defer std.testing.allocator.free(buf);
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    const al = fba.allocator();
     inline for (number_types) |in| {
         inline for (number_types) |out| {
             if (in == out) {
                 continue;
             }
-            defer reset_ctx(ctx);
+            defer fba.reset();
             const len = r.uintLessThan(usize, 4096);
 
-            var a_stream = make_stream(in, ctx, len);
-            var b_stream = make_stream(out, ctx, len);
+            var a_stream = try al.alloc(in, len);
+            var b_stream = try al.alloc(out, len);
             for (0..len) |i| {
                 const value = smart_random(in, out, r);
                 a_stream[i] = value;
                 b_stream[i] = cast(in, out, value);
             }
 
-            const b_actual_stream = make_stream(out, ctx, len);
+            const b_actual_stream = try al.alloc(out, len);
             const args = Apply_Args_Single(in, out){
-                .x = a_stream,
-                .y = b_actual_stream,
+                .x = a_stream.ptr,
+                .y = b_actual_stream.ptr,
                 .len = len,
             };
             apply_single(in, out, .Cast, args);
             // print_vek(num_t, c_expect_stream);
             // print_vek(num_t, c_actual_stream);
-            try testing.expectEqualSlices(out, b_stream[0..len], b_actual_stream[0..len]);
+            try testing.expectEqualSlices(out, b_stream, b_actual_stream);
         }
     }
 }
 test "apply bool + select" {
-    init();
-    defer deinit();
     const num_t = f64;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.reset(.free_all);
+    const al = arena.allocator();
 
-    const ctx = make_ctx(1024);
-    defer free_ctx(ctx);
+    var a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
 
-    const a_arr = [_]num_t{ 0, 1, 7, 69, 420, 666, 6969, 50, 100, 10, 20 };
-    const a_stream = make_stream(num_t, ctx, a_arr.len);
-    @memcpy(a_stream, &a_arr);
+    var b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
 
-    const b_arr = [_]num_t{ 0, 1, 3, 96, 580, 444, 9696, 50, 100, 10, 20 };
-    const b_stream = make_stream(num_t, ctx, b_arr.len);
-    @memcpy(b_stream, &b_arr);
-
-    const pred_stream = make_stream(u1, ctx, b_arr.len);
+    const pred_stream = try al.alloc(bool, b_arr.len);
     apply_bool(num_t, .Eq, .Vector, .Vector, Apply_Bool_Args(num_t, .Vector, .Vector){
-        .a = a_stream,
-        .b = b_stream,
-        .c = pred_stream,
+        .a = &a_arr,
+        .b = &b_arr,
+        .c = pred_stream.ptr,
         .len = a_arr.len,
     });
 
-    const c_actual_stream = make_stream(num_t, ctx, b_arr.len);
+    const c_actual_stream = try al.alloc(num_t, b_arr.len);
     select(num_t, .Vector, .Number, Select_Args(num_t, .Vector, .Number){
-        .a = a_stream,
+        .a = &a_arr,
         .b = -1,
-        .pred = pred_stream,
-        .c = c_actual_stream,
+        .pred = pred_stream.ptr,
+        .c = c_actual_stream.ptr,
         .len = b_arr.len,
     });
     // print_vek(num_t, c_expect_stream);
     // print_vek(num_t, c_actual_stream);
     var c_expect_arr = [_]num_t{ 0, 1, -1, -1, -1, -1, -1, 50, 100, 10, 20 };
-    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual_stream[0..a_arr.len]);
+    try testing.expectEqualSlices(num_t, &c_expect_arr, c_actual_stream);
 }
