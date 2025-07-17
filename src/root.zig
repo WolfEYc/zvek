@@ -426,6 +426,60 @@ pub inline fn apply_single(
     }
 }
 
+pub const Simd_Op_Cum = enum {
+    CumSum,
+    CumProd,
+};
+
+const simd_cum_ops = [_]Simd_Op_Cum{
+    .CumSum,
+    .CumProd,
+};
+
+fn Apply_Args_Cum(comptime T: type) type {
+    return struct {
+        x: [*]T,
+        len: usize,
+    };
+}
+
+pub inline fn apply_cum(
+    comptime T: type,
+    comptime Op: Simd_Op_Cum,
+    args: Apply_Args_Cum(T),
+) T {
+    const x = args.x;
+    const len = args.len;
+    const num_lanes = lanes(T);
+    const simd_len = (len / num_lanes) * num_lanes;
+    const vek_t = Vek(T);
+    var acc: vek_t = @splat(0);
+    var i: usize = 0;
+    while (i < simd_len) : (i += num_lanes) {
+        const x_vek: vek_t = x[i..][0..num_lanes].*;
+        acc = switch (Op) {
+            .CumSum => acc + x_vek,
+            .CumProd => acc * x_vek,
+        };
+    }
+    var res: T = 0;
+    // leftovers
+    while (i < len) : (i += 1) {
+        res = switch (Op) {
+            .CumSum => res + x[i],
+            .CumProd => res * x[i],
+        };
+    }
+    const arr: [num_lanes]T = acc;
+    for (arr) |value| {
+        res = switch (Op) {
+            .CumSum => res + value,
+            .CumProd => res * value,
+        };
+    }
+    return res;
+}
+
 // TODO
 pub const SimdOp3 = enum {
     Fma,
@@ -566,6 +620,9 @@ comptime {
             }
             generate_apply_single_func(t, cast_t, .Cast);
         }
+        for (simd_cum_ops) |op| {
+            generate_apply_cum_func(t, op);
+        }
     }
 }
 
@@ -639,6 +696,17 @@ fn generate_apply_single_func(
     @export(&struct {
         fn generated(args: *Apply_Args_Single(T, O)) callconv(.C) void {
             apply_single(T, O, op, args.*);
+        }
+    }.generated, .{ .name = name });
+}
+fn generate_apply_cum_func(
+    comptime T: type,
+    comptime op: Simd_Op_Cum,
+) void {
+    const name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
+    @export(&struct {
+        fn generated(args: *Apply_Args_Cum(T)) callconv(.C) T {
+            return apply_cum(T, op, args.*);
         }
     }.generated, .{ .name = name });
 }
