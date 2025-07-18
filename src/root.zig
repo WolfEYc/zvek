@@ -626,6 +626,23 @@ comptime {
     }
 }
 
+fn Set_Args(comptime T: type) type {
+    return struct {
+        a: [*]T,
+        b: T,
+        len: usize,
+    };
+}
+
+fn generate_set_func(comptime T: type) void {
+    const name: []const u8 = "Set_" ++ @typeName(T);
+    @export(&struct {
+        fn generated(args: *Set_Args(T)) callconv(.C) void {
+            @memset(args.a[0..args.len], args.b);
+        }
+    }.generated, .{ .name = name });
+}
+
 fn generate_apply_func(
     comptime T: type,
     comptime op: Simd_Op,
