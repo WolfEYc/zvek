@@ -537,6 +537,7 @@ pub inline fn select(comptime T: type, comptime a_t: Operand_Variant, comptime b
 comptime {
     @setEvalBranchQuota(4096);
     for (number_types) |t| {
+        generate_set_func(t);
         var is_float_t = false;
         for (float_types) |float_ts| {
             if (t != float_ts) continue;
