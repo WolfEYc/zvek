@@ -153,7 +153,10 @@ pub inline fn apply(
         c[i] = switch (op) {
             .Add => a_num + b_num,
             .Sub => a_num - b_num,
-            .Div => @divTrunc(a_num, b_num),
+            .Div => switch (T) {
+                f32, f64 => a_num / b_num,
+                else => @divTrunc(a_num, b_num),
+            },
             .Mul => a_num * b_num,
             .Mod => @mod(a_num, b_num),
             .Min => @min(a_num, b_num),
