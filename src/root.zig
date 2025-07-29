@@ -426,27 +426,27 @@ pub inline fn apply_single(
     }
 }
 
-pub const Simd_Op_Cum = enum {
-    CumSum,
-    CumProd,
+pub const Simd_Op_Sum = enum {
+    Sum,
+    Prod,
 };
 
-const simd_cum_ops = [_]Simd_Op_Cum{
-    .CumSum,
-    .CumProd,
+const simd_sum_ops = [_]Simd_Op_Sum{
+    .Sum,
+    .Prod,
 };
 
-fn Apply_Args_Cum(comptime T: type) type {
+fn Apply_Args_Sum(comptime T: type) type {
     return struct {
         x: [*]T,
         len: usize,
     };
 }
 
-pub inline fn apply_cum(
+pub inline fn apply_sum(
     comptime T: type,
-    comptime Op: Simd_Op_Cum,
-    args: Apply_Args_Cum(T),
+    comptime Op: Simd_Op_Sum,
+    args: Apply_Args_Sum(T),
 ) T {
     const x = args.x;
     const len = args.len;
@@ -458,23 +458,23 @@ pub inline fn apply_cum(
     while (i < simd_len) : (i += num_lanes) {
         const x_vek: vek_t = x[i..][0..num_lanes].*;
         acc = switch (Op) {
-            .CumSum => acc + x_vek,
-            .CumProd => acc * x_vek,
+            .Sum => acc + x_vek,
+            .Prod => acc * x_vek,
         };
     }
     var res: T = 0;
     // leftovers
     while (i < len) : (i += 1) {
         res = switch (Op) {
-            .CumSum => res + x[i],
-            .CumProd => res * x[i],
+            .Sum => res + x[i],
+            .Prod => res * x[i],
         };
     }
     const arr: [num_lanes]T = acc;
     for (arr) |value| {
         res = switch (Op) {
-            .CumSum => res + value,
-            .CumProd => res * value,
+            .Sum => res + value,
+            .Prod => res * value,
         };
     }
     return res;
@@ -621,8 +621,8 @@ comptime {
             }
             generate_apply_single_func(t, cast_t, .Cast);
         }
-        for (simd_cum_ops) |op| {
-            generate_apply_cum_func(t, op);
+        for (simd_sum_ops) |op| {
+            generate_apply_sum_func(t, op);
         }
     }
 }
@@ -717,14 +717,14 @@ fn generate_apply_single_func(
         }
     }.generated, .{ .name = name });
 }
-fn generate_apply_cum_func(
+fn generate_apply_sum_func(
     comptime T: type,
-    comptime op: Simd_Op_Cum,
+    comptime op: Simd_Op_Sum,
 ) void {
     const name: []const u8 = @tagName(op) ++ "_" ++ @typeName(T);
     @export(&struct {
-        fn generated(args: *Apply_Args_Cum(T)) callconv(.C) T {
-            return apply_cum(T, op, args.*);
+        fn generated(args: *Apply_Args_Sum(T)) callconv(.C) T {
+            return apply_sum(T, op, args.*);
         }
     }.generated, .{ .name = name });
 }
