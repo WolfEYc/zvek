@@ -183,7 +183,7 @@ pub const Simd_Bool_Op = enum {
 };
 
 fn Apply_Bool_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return struct {
+    return extern struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
         c: [*]bool,
@@ -206,9 +206,11 @@ pub inline fn apply_bool(
     const c = args.c;
     const len = args.len;
     const num_lanes = lanes(T);
+    std.debug.print("bout to {}, len={}\n", .{ op, len });
     const simd_len = (len / num_lanes) * num_lanes;
 
     var i: usize = 0;
+    std.debug.print("bout to simd, simd_len={}\n", .{simd_len});
     while (i < simd_len) : (i += num_lanes) {
         const a_vek: Vek(T) = switch (a_t) {
             .Number => @splat(a),
@@ -227,6 +229,7 @@ pub inline fn apply_bool(
             .Neq => a_vek != b_vek,
         };
     }
+    std.debug.print("bout to leftover, len={}\n", .{len});
     // leftovers
     while (i < len) : (i += 1) {
         const a_num: T = switch (a_t) {
@@ -297,7 +300,7 @@ fn unsigned_variant(comptime T: type) type {
 }
 
 fn Apply_Args_Single(comptime T: type, comptime O: type) type {
-    return struct {
+    return extern struct {
         x: [*]T,
         y: [*]O,
         len: usize,
@@ -440,7 +443,7 @@ const simd_sum_ops = [_]Simd_Op_Sum{
 };
 
 fn Apply_Args_Sum(comptime T: type) type {
-    return struct {
+    return extern struct {
         x: [*]T,
         len: usize,
     };
@@ -489,7 +492,7 @@ pub const SimdOp3 = enum {
 };
 
 fn Select_Args(comptime T: type, comptime a_t: Operand_Variant, b_t: Operand_Variant) type {
-    return struct {
+    return extern struct {
         a: Operand(T, a_t),
         b: Operand(T, b_t),
         pred: [*]bool,
@@ -631,7 +634,7 @@ comptime {
 }
 
 fn Set_Args(comptime T: type) type {
-    return struct {
+    return extern struct {
         a: [*]T,
         b: T,
         len: usize,
