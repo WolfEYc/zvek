@@ -206,11 +206,9 @@ pub inline fn apply_bool(
     const c = args.c;
     const len = args.len;
     const num_lanes = lanes(T);
-    std.debug.print("bout to {}, len={}\n", .{ op, len });
     const simd_len = (len / num_lanes) * num_lanes;
 
     var i: usize = 0;
-    std.debug.print("bout to simd, simd_len={}\n", .{simd_len});
     while (i < simd_len) : (i += num_lanes) {
         const a_vek: Vek(T) = switch (a_t) {
             .Number => @splat(a),
@@ -229,7 +227,6 @@ pub inline fn apply_bool(
             .Neq => a_vek != b_vek,
         };
     }
-    std.debug.print("bout to leftover, len={}\n", .{len});
     // leftovers
     while (i < len) : (i += 1) {
         const a_num: T = switch (a_t) {
